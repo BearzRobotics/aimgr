@@ -217,8 +217,14 @@ const mib: f64 = 1024 * 1024;
 /// `reported_bytes`: size the backend reported (preferred). Otherwise weights are
 /// estimated from parameter count (name) x quantization, flagged as estimated.
 pub fn estimate(id: []const u8, quant: ?[]const u8, reported_bytes: ?u64, ctx: u32, hw: Info) Fit {
+    return estimateWith(id, quant, reported_bytes, null, ctx, hw);
+}
+
+/// Like `estimate`, preferring an exact parameter count (from `ollama show` or the catalog) over
+/// one parsed from the name.
+pub fn estimateWith(id: []const u8, quant: ?[]const u8, reported_bytes: ?u64, params_override: ?f64, ctx: u32, hw: Info) Fit {
     var f: Fit = .{ .verdict = .unknown, .ctx = ctx };
-    const params_b = parseParamsB(id);
+    const params_b = params_override orelse parseParamsB(id);
     if (reported_bytes) |b| {
         f.weights = b;
     } else if (params_b != null and quant != null and bytesPerParam(quant.?) != null) {

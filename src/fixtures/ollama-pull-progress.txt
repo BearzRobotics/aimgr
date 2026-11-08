@@ -1,0 +1,24 @@
+[?2026h[?25l[1Gpulling manifest ⠋ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠙ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠹ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠸ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠼ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠴ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠦ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠧ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠇ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠏ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠋ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠙ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠹ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠸ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠼ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠴ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠦ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠧ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠇ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠏ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠋ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠙ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠹ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠸ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠼ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest ⠴ [K[?25h[?2026l[?2026h[?25l[1Gpulling manifest [K
+pulling f535f83ec568:   0% ▕                  ▏  38 KB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   0% ▕                  ▏ 210 KB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   0% ▕                  ▏ 440 KB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   0% ▕                  ▏ 703 KB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   0% ▕                  ▏ 1.0 MB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   1% ▕                  ▏ 1.7 MB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568:   1% ▕                  ▏ 2.9 MB/270 MB                  [K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f53
+0 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K[?25h[?2026l[?2026h[?25l[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K
+pulling b0f58c4c1a3c: 100% ▕██████████████████▏  561 B                         [K
+verifying sha256 digest ⠋ [K[?25h[?2026l[?2026h[?25l[A[A[A[1Gpulling manifest [K
+pulling f535f83ec568: 100% ▕█████████████████ ▏ 270 MB/270 MB   28 MB/s      0s[K
+pulling b0f58c4c1a3c: 100% ▕██████████████████▏  561 B                         [K
+verifying sha256 digest [K
+writing manifest [K
+success [K[?25h[?2026l

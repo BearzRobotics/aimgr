@@ -5,6 +5,7 @@
 //! Ollama has no documented public search API, so Ollama discovery is not offered.
 const std = @import("std");
 const abl = @import("abliterate.zig");
+const http = @import("http.zig");
 
 pub const Result = struct {
     id: []const u8,
@@ -62,14 +63,14 @@ pub const Sort = enum {
     }
 };
 
-pub fn buildBrowseUrl(arena: std.mem.Allocator, sort: Sort, limit: u32) ![]u8 {
-    return std.fmt.allocPrint(arena, "https://huggingface.co/api/models?filter=gguf&pipeline_tag=text-generation&sort={s}&direction=-1&limit={d}", .{ sort.apiName(), limit });
+pub fn buildBrowseUrl(arena: std.mem.Allocator, endpoint: []const u8, sort: Sort, limit: u32) ![]u8 {
+    return std.fmt.allocPrint(arena, "{s}/api/models?filter=gguf&pipeline_tag=text-generation&sort={s}&direction=-1&limit={d}", .{ std.mem.trimEnd(u8, endpoint, "/"), sort.apiName(), limit });
 }
 
-pub fn buildUrl(arena: std.mem.Allocator, query: []const u8, limit: u32) ![]u8 {
+pub fn buildUrl(arena: std.mem.Allocator, endpoint: []const u8, query: []const u8, limit: u32) ![]u8 {
     const enc = try encodeQuery(arena, query);
     if (enc.len == 0) return error.EmptyQuery;
-    return std.fmt.allocPrint(arena, "https://huggingface.co/api/models?search={s}&filter=gguf&sort=downloads&direction=-1&limit={d}", .{ enc, limit });
+    return std.fmt.allocPrint(arena, "{s}/api/models?search={s}&filter=gguf&sort=downloads&direction=-1&limit={d}", .{ std.mem.trimEnd(u8, endpoint, "/"), enc, limit });
 }
 
 fn isGated(v: ?std.json.Value) bool {
@@ -93,30 +94,25 @@ pub fn parseResults(arena: std.mem.Allocator, body: []const u8) Error![]Result {
     return out.toOwnedSlice(arena);
 }
 
-pub fn search(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, query: []const u8, limit: u32) Error![]Result {
-    const url = buildUrl(arena, query, limit) catch |e| return e;
+pub fn search(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, query: []const u8, limit: u32) Error![]Result {
+    const url = buildUrl(arena, endpoint, query, limit) catch |e| return e;
     return fetchUrl(arena, gpa, io, url);
 }
 
 /// List GGUF text-generation repos without a query (explicit network call).
-pub fn browse(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, sort: Sort, limit: u32) Error![]Result {
-    const url = try buildBrowseUrl(arena, sort, limit);
+pub fn browse(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, endpoint: []const u8, sort: Sort, limit: u32) Error![]Result {
+    const url = try buildBrowseUrl(arena, endpoint, sort, limit);
     return fetchUrl(arena, gpa, io, url);
 }
 
 fn fetchUrl(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, url: []const u8) Error![]Result {
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-    var body: std.Io.Writer.Allocating = .init(gpa);
-    defer body.deinit();
-    const res = client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &body.writer,
-        .extra_headers = &.{.{ .name = "user-agent", .value = "aimgr (local model manager)" }},
-    }) catch return error.NetworkFailed;
-    if (res.status != .ok) return error.BadResponse;
-    if (body.written().len > 4 << 20) return error.BadResponse;
-    return parseResults(arena, body.written());
+    const body = http.get(gpa, io, url, 4 << 20) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.NetworkFailed => error.NetworkFailed,
+        error.BadStatus, error.TooLarge => error.BadResponse,
+    };
+    defer gpa.free(body);
+    return parseResults(arena, body);
 }
 
 test "query encoding" {
@@ -125,7 +121,7 @@ test "query encoding" {
     try std.testing.expectEqualStrings("qwen2.5-coder%2014b", try encodeQuery(a.allocator(), "  qwen2.5-coder 14b "));
     try std.testing.expectEqualStrings("a%26b%3Dc%23", try encodeQuery(a.allocator(), "a&b=c#"));
     try std.testing.expectEqualStrings("ab", try encodeQuery(a.allocator(), "a\x01b\n"));
-    try std.testing.expectError(error.EmptyQuery, buildUrl(a.allocator(), "  ", 5));
+    try std.testing.expectError(error.EmptyQuery, buildUrl(a.allocator(), "https://huggingface.co", "  ", 5));
 }
 
 test "parse results, dropping hostile ids" {
@@ -158,9 +154,10 @@ test "results do not alias the response buffer" {
 test "browse url" {
     var a = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer a.deinit();
-    const u = try buildBrowseUrl(a.allocator(), .trending, 40);
+    const u = try buildBrowseUrl(a.allocator(), "https://mirror.example/", .trending, 40);
     try std.testing.expect(std.mem.indexOf(u8, u, "sort=trendingScore") != null);
     try std.testing.expect(std.mem.indexOf(u8, u, "limit=40") != null);
+    try std.testing.expect(std.mem.startsWith(u8, u, "https://mirror.example/api/models?"));
     try std.testing.expectEqual(Sort.downloads, Sort.trending.next());
     try std.testing.expectEqual(Sort.trending, Sort.recent.next());
 }

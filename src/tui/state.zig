@@ -39,6 +39,8 @@ pub const App = struct {
     report: inventory.Inventory = undefined,
     loaded: catalog_io.Loaded = .{},
     rows: []model.Row = &.{},
+    /// `ollama show` facts for installed Ollama models (rebuilt on refresh).
+    infos: model.InfoMap = .empty,
     /// Results of the last online search (kept across refreshes).
     online_arena: std.heap.ArenaAllocator,
     online: []model.OnlineHit = &.{},
@@ -52,6 +54,7 @@ pub const App = struct {
     prompt: ?[]const u8 = null,
     prompt_buf: std.ArrayList(u8) = .empty,
     prompt_is_search: bool = false,
+    prompt_is_agent: bool = false,
     /// Next sort used by the Discover "N" browse key (cycles each press).
     browse_sort: discover.Sort = .trending,
     sort: model.Sort = .name,

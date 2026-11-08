@@ -51,3 +51,14 @@ fn hasHelper(io: std.Io, arena: std.mem.Allocator, dir: []const u8) bool {
     std.Io.Dir.cwd().access(io, p, .{}) catch return false;
     return true;
 }
+
+/// $XDG_CACHE_HOME/aimgr/<sub> or ~/.cache/aimgr/<sub>.
+pub fn cachePath(arena: std.mem.Allocator, env: *const std.process.Environ.Map, sub: []const u8) !?[]const u8 {
+    if (env.get("XDG_CACHE_HOME")) |x| {
+        if (x.len > 0 and x[0] == '/') return try std.fs.path.join(arena, &.{ x, "aimgr", sub });
+    }
+    if (env.get("HOME")) |h| {
+        if (h.len > 0) return try std.fs.path.join(arena, &.{ h, ".cache", "aimgr", sub });
+    }
+    return null;
+}

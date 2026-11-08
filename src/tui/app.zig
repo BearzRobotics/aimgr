@@ -15,8 +15,12 @@ const launcher = @import("../launcher.zig");
 const manage = @import("../manage.zig");
 const netstat = @import("../netstat.zig");
 const supervise = @import("../supervise.zig");
+const sources_io = @import("../sources_io.zig");
+const agent_settings = @import("../agent/settings.zig");
 const abl = @import("../abliterate.zig");
 const hardware = @import("../hardware.zig");
+const agent_policy = @import("../agent/policy.zig");
+const modelinfo = @import("../modelinfo.zig");
 
 const App = State.App;
 
@@ -100,6 +104,16 @@ pub fn refresh(app: *App) void {
     app.report = inventory.discover(a, app.gpa, app.io);
     app.loaded = catalog_io.loadAll(a, app.gpa, app.io, app.environ) catch .{};
     app.hw = hardware.detect(a, app.gpa, app.io) catch .{ .mem = .{}, .gpus = &.{} };
+    app.infos = .empty;
+    var asked: usize = 0;
+    for (app.report.reports) |r| {
+        if (r.kind != .ollama) continue;
+        for (r.models orelse &.{}) |m| {
+            if (asked >= 80) break;
+            asked += 1;
+            if (modelinfo.fetchOllama(a, app.gpa, app.io, m.id)) |info| app.infos.put(a, m.id, info) catch {};
+        }
+    }
     rebuildRows(app);
     if (app.loaded.warnings.len > 0 and app.message.len == 0) app.setMessage(true, "{s}", .{app.loaded.warnings[0]});
     for (app.report.reports) |r| {
@@ -112,6 +126,7 @@ fn rebuildRows(app: *App) void {
     app.rows = model.buildRowsEx(app.data.allocator(), app.tab, app.report, &app.loaded.cat, app.filter.items, app.sort, app.only_abliterated, app.online, .{
         .use = if (app.use_idx > 0) model.use_tags[app.use_idx - 1] else null,
         .access = app.access_filter,
+        .infos = &app.infos,
     }) catch &.{};
 }
 
@@ -184,6 +199,7 @@ fn handleKey(app: *App, key: term.Key) void {
     switch (key) {
         .resize, .none => {},
         .ctrl_c => requestQuit(app),
+        .redraw => term.redraw(),
         .esc => {
             app.setMessage(false, "", .{});
             app.detail_full = false;
@@ -296,6 +312,7 @@ fn charKey(app: *App, ch: u21) void {
             app.sel[@backingInt(app.tab)] = 0;
             rebuildRows(app);
         },
+        'g' => if (app.tab == .installed) beginAgent(app),
         'c' => chat(app),
         's' => startServer(app),
         'd' => askRowAction(app, .pull),
@@ -372,8 +389,8 @@ fn execute(app: *App, act: State.Action) void {
             app.jobs.kill(j);
             app.setMessage(false, "sent SIGKILL to job #{d}", .{id});
         },
-        .abliterate => |repo| startSelf(app, .abliterate, &.{ "abliterate", "run", repo, "--yes" }, repo),
-        .abliterate_setup => startSelf(app, .setup, &.{ "abliterate", "setup", "--yes" }, ""),
+        .abliterate => |repo| startSelf(app, .abliterate, .ollama, &.{ "abliterate", "run", repo, "--yes" }, abl.deriveName(app.frame.allocator(), repo) catch repo),
+        .abliterate_setup => startSelf(app, .setup, .ollama, &.{ "abliterate", "setup", "--yes" }, ""),
         .pull => |t| startManage(app, .pull, t),
         .update => |t| startManage(app, .update, t),
         .remove => |t| startManage(app, .remove, t),
@@ -381,6 +398,12 @@ fn execute(app: *App, act: State.Action) void {
 }
 
 fn startManage(app: *App, kind: manage.Action, t: State.Target) void {
+    // llama prints no progress when not on a terminal: run the download through `aimgr pull`,
+    // which measures it (see dlwatch.zig) and prints progress lines the Transfers tab turns into a bar.
+    if (t.backend == .llama and kind != .remove) {
+        const jk: jobs_mod.Kind = if (kind == .pull) .pull else .update;
+        return startSelf(app, jk, .llama, &.{ @tagName(kind), "llama", t.id, "--yes" }, t.id);
+    }
     const argv = manage.plan(app.frame.allocator(), t.backend, kind, t.id) catch |e| return app.setMessage(true, "{s}", .{manage.errorText(e)});
     const jk: jobs_mod.Kind = switch (kind) {
         .pull => .pull,
@@ -389,6 +412,7 @@ fn startManage(app: *App, kind: manage.Action, t: State.Target) void {
     };
     const err = app.jobs.start(jk, t.backend, t.id, argv, app.environ, app.log_dir, null) catch return app.setMessage(true, "could not start job (out of memory)", .{});
     if (err.len > 0) return app.setMessage(true, "{s}: {s}", .{ argv[0], err });
+    selectNewest(app, jk);
     app.setMessage(false, "started {s} {s} {s}; see Transfers (key 3)", .{ @tagName(kind), t.backend.name(), t.id });
 }
 
@@ -462,6 +486,7 @@ fn beginAbliterate(app: *App) void {
         return openModal(app, text, .abliterate_setup);
     };
     app.prompt_is_search = false;
+    app.prompt_is_agent = false;
     app.prompt = "Hugging Face repo to abliterate (owner/name, full-precision safetensors):";
     app.prompt_buf.clearRetainingCapacity();
 }
@@ -471,7 +496,7 @@ fn promptKey(app: *App, key: term.Key) void {
         .esc => {
             app.prompt = null;
         },
-        .enter => if (app.prompt_is_search) submitSearch(app) else submitPrompt(app),
+        .enter => if (app.prompt_is_agent) submitAgent(app) else if (app.prompt_is_search) submitSearch(app) else submitPrompt(app),
         .backspace => if (app.prompt_buf.items.len > 0) {
             var n = app.prompt_buf.items.len - 1;
             while (n > 0 and (app.prompt_buf.items[n] & 0xC0) == 0x80) n -= 1;
@@ -514,15 +539,15 @@ fn submitPrompt(app: *App) void {
 }
 
 /// Run `aimgr <args>` (this same executable) as a background job.
-fn startSelf(app: *App, kind: jobs_mod.Kind, args: []const []const u8, repo: []const u8) void {
+fn startSelf(app: *App, kind: jobs_mod.Kind, be: backend.Kind, args: []const []const u8, label: []const u8) void {
     const fa = app.frame.allocator();
     const exe = std.process.executablePathAlloc(app.io, fa) catch return app.setMessage(true, "cannot locate the aimgr executable", .{});
     var argv: std.ArrayList([]const u8) = .empty;
     argv.append(fa, exe) catch return;
     argv.appendSlice(fa, args) catch return;
-    const label = if (kind == .abliterate) (abl.deriveName(fa, repo) catch repo) else "";
-    const err = app.jobs.start(kind, .ollama, label, argv.items, app.environ, app.log_dir, null) catch return app.setMessage(true, "could not start job (out of memory)", .{});
+    const err = app.jobs.start(kind, be, label, argv.items, app.environ, app.log_dir, null) catch return app.setMessage(true, "could not start job (out of memory)", .{});
     if (err.len > 0) return app.setMessage(true, "{s}", .{err});
+    selectNewest(app, kind);
     app.setMessage(false, "started {s}; see Transfers (key 3). x there cancels it", .{@tagName(kind)});
 }
 
@@ -533,12 +558,13 @@ fn startSelf(app: *App, kind: jobs_mod.Kind, args: []const []const u8, repo: []c
 fn browseOnline(app: *App) void {
     const sort = app.browse_sort;
     app.browse_sort = sort.next();
-    startSelf(app, .search, &.{ "browse", "--sort", @tagName(sort), "--limit", "40" }, "");
+    startSelf(app, .search, .llama, &.{ "browse", "--sort", @tagName(sort), "--limit", "40" }, "");
     app.setMessage(false, "browsing online models sorted by {s} (network, runs as a job); press N again for the next sort", .{@tagName(sort)});
 }
 
 fn beginSearch(app: *App) void {
     app.prompt_is_search = true;
+    app.prompt_is_agent = false;
     app.prompt = "Search Hugging Face for GGUF models (uses the network):";
     app.prompt_buf.clearRetainingCapacity();
 }
@@ -549,7 +575,7 @@ fn submitSearch(app: *App) void {
     const q = std.mem.trim(u8, app.prompt_buf.items, " ");
     if (q.len == 0) return;
     if (std.mem.startsWith(u8, q, "-")) return app.setMessage(true, "search text must not start with '-'", .{});
-    startSelf(app, .search, &.{ "search", q, "--limit", "30" }, "");
+    startSelf(app, .search, .llama, &.{ "search", q, "--limit", "30" }, "");
 }
 
 /// Load results of finished `aimgr search` jobs into the Discover list.
@@ -599,4 +625,66 @@ fn accessNote(app: *App, text: *std.ArrayList(u8), fa: std.mem.Allocator, row: m
     if (a == .signin and app.environ.get("HF_TOKEN") == null) {
         text.appendSlice(fa, "HF_TOKEN is not set in aimgr's environment, so a gated download will fail. ") catch return;
     }
+}
+
+/// Point the Transfers/Servers selection at the job that was just started.
+fn selectNewest(app: *App, kind: jobs_mod.Kind) void {
+    var n: usize = 0;
+    const want_server = kind == .server;
+    for (app.jobs.list.items) |j| {
+        if ((j.kind == .server) == want_server) n += 1;
+    }
+    if (n == 0) return;
+    app.sel[@backingInt(if (want_server) model.Tab.servers else model.Tab.transfers)] = n - 1;
+}
+
+// ---- agent mode ---------------------------------------------------------
+
+/// `g`: let the selected tool-capable Ollama model look at a directory (see ai/SPEC.md, "Agent mode").
+fn beginAgent(app: *App) void {
+    const row = app.currentRow() orelse return app.setMessage(true, "no model selected", .{});
+    if (row.model.backend != .ollama) return app.setMessage(true, "agent mode currently supports ollama models only", .{});
+    if (!row.installed) return app.setMessage(true, "only installed models can be used", .{});
+    if (row.access == .cloud) return app.setMessage(true, "cloud models are not given access to this computer", .{});
+    const info = row.info orelse return app.setMessage(true, "ollama did not describe this model, so tool support is unknown", .{});
+    if (!info.hasCap("tools")) return app.setMessage(true, "ollama reports no tool support for this model; pick one tagged [tools]", .{});
+    // A stored directory means no question: the settings are the user's.
+    const entries = sources_io.loadAgents(app.frame.allocator(), app.gpa, app.io, app.environ) catch &.{};
+    if (agent_settings.find(entries, .ollama, row.model.id)) |i| if (entries[i].dirs != null) return runAgent(app, row.model.id, null);
+    app.prompt_is_agent = true;
+    app.prompt_is_search = false;
+    app.prompt = "Directory the model may look at (absolute path; it cannot leave it):";
+    app.prompt_buf.clearRetainingCapacity();
+}
+
+fn submitAgent(app: *App) void {
+    app.prompt = null;
+    app.prompt_is_agent = false;
+    const dir = std.mem.trim(u8, app.prompt_buf.items, " ");
+    if (dir.len == 0) return app.setMessage(false, "agent cancelled (no directory entered)", .{});
+    if (dir[0] != '/') return app.setMessage(true, "the directory must be an absolute path", .{});
+    const row = app.currentRow() orelse return;
+    runAgent(app, row.model.id, dir);
+}
+
+/// Leave the TUI, run `aimgr agent ...` on the real terminal (it prints every tool call and asks before
+/// anything beyond read-only), then come back.
+fn runAgent(app: *App, id: []const u8, dir: ?[]const u8) void {
+    const fa = app.frame.allocator();
+    const exe = std.process.executablePathAlloc(app.io, fa) catch return app.setMessage(true, "cannot locate the aimgr executable", .{});
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(fa, &.{ exe, "agent", "ollama", id }) catch return;
+    if (dir) |d| argv.appendSlice(fa, &.{ "--dir", d }) catch return;
+    term.suspendTerm();
+    var ob: [1024]u8 = undefined;
+    var eb: [1024]u8 = undefined;
+    var ow: std.Io.File.Writer = .initStreaming(.stdout(), app.io, &ob);
+    var ew: std.Io.File.Writer = .initStreaming(.stderr(), app.io, &eb);
+    const env: supervise.Env = .{ .gpa = app.gpa, .io = app.io, .environ = app.environ, .out = &ow.interface, .err = &ew.interface, .log_dir = null };
+    const code = supervise.runChat(env, .{ .argv = argv.items }) catch 1;
+    ow.interface.flush() catch {};
+    ew.interface.flush() catch {};
+    term.resumeTerm();
+    installSignals();
+    if (code == 0) app.setMessage(false, "agent session ended", .{}) else app.setMessage(true, "agent exited with code {d} (see the messages above in your terminal history)", .{code});
 }

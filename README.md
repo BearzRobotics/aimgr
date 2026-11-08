@@ -12,7 +12,7 @@ zig build -Doptimize=ReleaseSafe
 ```
 
 Highlights: a ~150-model bundled catalog with access (open / sign-in / cloud) and good-for tags, `aimgr browse`, `aimgr list --fit`, `aimgr hardware`, `aimgr search`, `aimgr chat|serve|pull|update|remove`,
-`aimgr abliterate` (create an abliterated copy of a model).
+`aimgr agent` (let a tool-capable local model inspect a directory under strict, per-model guardrails), `aimgr abliterate` (create an abliterated copy of a model).
 
 Vendored, pinned sources (no network at build time): `vendor/toml-zig`, `vendor/libvaxis`,
 `vendor/uucode`, `vendor/llama-convert` (see each `VENDORED.txt`). Design decisions: `docs/decisions/`.

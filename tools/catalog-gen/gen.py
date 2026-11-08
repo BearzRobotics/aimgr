@@ -53,7 +53,7 @@ def arr(xs):
     return "[" + ", ".join(esc(x) for x in xs) + "]"
 
 
-def entry(backend, id_, name, description, use_cases=(), tags=(), notes=None, access=None):
+def entry(backend, id_, name, description, use_cases=(), tags=(), notes=None, access=None, size_bytes=None, params_b=None, context=None):
     lines = ["[[model]]", f"backend = {esc(backend)}", f"id = {esc(id_)}", f"name = {esc(name)}", f"description = {esc(description)}"]
     if use_cases:
         lines.append(f"use_cases = {arr(use_cases)}")
@@ -61,6 +61,12 @@ def entry(backend, id_, name, description, use_cases=(), tags=(), notes=None, ac
         lines.append(f"tags = {arr(tags)}")
     if access:
         lines.append(f"access = {esc(access)}")
+    if size_bytes:
+        lines.append(f"size_bytes = {int(size_bytes)}")
+    if params_b:
+        lines.append(f"params_b = {round(float(params_b), 3)}")
+    if context:
+        lines.append(f"context = {int(context)}")
     if notes:
         lines.append(f"notes = {esc(notes)}")
     return "\n".join(lines) + "\n"
@@ -151,7 +157,7 @@ def ollama_entries():
             picked = [picked[0], picked[len(picked) // 2], picked[-1]]
         for tag, total in picked:
             use = derive_uses(f"{name}:{tag}", caps=caps, params_b=parse_params_b(tag))
-            out.append(entry("ollama", f"{name}:{tag}", f"{name} {tag}", desc, use, access="open",
+            out.append(entry("ollama", f"{name}:{tag}", f"{name} {tag}", desc, use, access="open", size_bytes=total, params_b=parse_params_b(tag),
                              notes=f"Registry download size about {total / 1e9:.1f} GB (from the registry manifest)."))
         if "cloud" in caps:
             try:
@@ -217,7 +223,8 @@ def hf_entries(pinned_text):
             uses = derive_uses(base, hf_tags=d.get("tags", []), ctx=g.get("context_length"),
                                params_b=(params / 1e9 if params else None), pipeline=d.get("pipeline_tag"))
             out.append(entry("llama", f"{rid}:{quant}" if quant else rid, title, desc, uses,
-                             access="signin" if gated else "open", notes=hf_note(gated)))
+                             access="signin" if gated else "open", notes=hf_note(gated),
+                             params_b=(params / 1e9 if params else None), context=g.get("context_length")))
             n += 1
             log(f"hf {rid}")
     return out
@@ -257,6 +264,7 @@ def abliterated_hf(seen_repos):
                            params_b=(g["total"] / 1e9 if g.get("total") else None), pipeline=d.get("pipeline_tag"))
         out.append(entry("llama", f"{rid}:{quant}" if quant else rid, title, desc, uses, ["abliterated"],
                          access="signin" if gated else "open",
+                         params_b=(g["total"] / 1e9 if g.get("total") else None), context=g.get("context_length"),
                          notes="Third-party abliterated model (refusal behavior removed by weight editing); unvetted, quality varies. " + hf_note(gated)))
         seen_repos.add(rid)
         n += 1
@@ -295,7 +303,7 @@ def abliterated_ollama():
         cand.sort()
         for total, tag in cand[:2]:
             out.append(entry("ollama", f"{full}:{tag}", f"{full} {tag}",
-                             f"Community abliterated model published by '{full.split('/')[0]}' in the Ollama registry.", derive_uses(f"{full}:{tag}", params_b=parse_params_b(tag) or parse_params_b(full)), ["abliterated"], access="open",
+                             f"Community abliterated model published by '{full.split('/')[0]}' in the Ollama registry.", derive_uses(f"{full}:{tag}", params_b=parse_params_b(tag) or parse_params_b(full)), ["abliterated"], access="open", size_bytes=total, params_b=parse_params_b(tag) or parse_params_b(full),
                              notes=f"Third-party, unvetted (refusal behavior removed by weight editing). Registry download size about {total / 1e9:.1f} GB (from the manifest)."))
             log(f"abliterated ollama {full}:{tag}")
     return out

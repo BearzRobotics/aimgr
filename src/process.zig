@@ -11,6 +11,8 @@ pub const Outcome = union(enum) {
     /// Executable found but could not be started (permissions, etc).
     spawn_failed,
     timed_out,
+    /// Output exceeded the cap and the process was stopped.
+    output_too_large,
 };
 
 pub const Result = struct {
@@ -32,14 +34,21 @@ const max_output = 4 * 1024 * 1024;
 
 /// Run `argv` to completion, capturing output. stdin is closed.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, timeout_s: u32) Result {
+    return runIn(gpa, io, argv, timeout_s, null, max_output);
+}
+
+/// Like `run`, in directory `cwd` (null = inherit) and with an explicit per-stream output cap.
+pub fn runIn(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, timeout_s: u32, cwd: ?[]const u8, limit: usize) Result {
     const r = std.process.run(gpa, io, .{
         .argv = argv,
-        .stdout_limit = .limited(max_output),
-        .stderr_limit = .limited(max_output),
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+        .stdout_limit = .limited(limit),
+        .stderr_limit = .limited(limit),
         .timeout = .{ .duration = .{ .raw = .fromSeconds(timeout_s), .clock = .awake } },
     }) catch |err| return .{ .outcome = switch (err) {
         error.FileNotFound => .not_found,
         error.Timeout => .timed_out,
+        error.StreamTooLong => .output_too_large,
         else => .spawn_failed,
     } };
     return .{

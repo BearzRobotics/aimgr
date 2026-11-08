@@ -5,6 +5,7 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const catalog = @import("../catalog.zig");
 const inventory = @import("../inventory.zig");
+const modelinfo = @import("../modelinfo.zig");
 
 pub const Tab = enum {
     installed,
@@ -52,6 +53,8 @@ pub const Row = struct {
     abliterated: bool,
     /// What it takes to get/run it (from the catalog, or "sign-in" for gated online hits).
     access: ?catalog.Access = null,
+    /// What the backend itself reports (ollama show); null if unavailable.
+    info: ?modelinfo.Info = null,
 
     pub fn title(self: Row) []const u8 {
         if (self.entry) |e| if (e.name) |n| return n;
@@ -94,7 +97,11 @@ fn lessThan(sort: Sort, a: Row, b: Row) bool {
 }
 
 /// Extra row filters (null = no restriction).
+pub const InfoMap = std.StringHashMapUnmanaged(modelinfo.Info);
+
 pub const Extra = struct {
+    /// ollama model id -> `ollama show` facts.
+    infos: ?*const InfoMap = null,
     /// Keep only entries whose use_cases contain this tag (exact, case-insensitive).
     use: ?[]const u8 = null,
     access: ?catalog.Access = null,
@@ -134,7 +141,11 @@ pub fn buildRowsEx(
     var rows: std.ArrayList(Row) = .empty;
     switch (tab) {
         .installed => for (report.reports) |r| for (r.models orelse &.{}) |m| {
-            try rows.append(arena, makeRow(m, cat.find(m.backend, m.id), true));
+            var row = makeRow(m, cat.find(m.backend, m.id), true);
+            if (extra.infos) |im| if (m.backend == .ollama) {
+                row.info = im.get(m.id);
+            };
+            try rows.append(arena, row);
         },
         .discover => for (cat.entries.items) |*e| {
             if (isInstalled(report, e.backend, e.id)) continue;
@@ -278,4 +289,70 @@ test "use and access filters" {
     const hits = [_]OnlineHit{.{ .id = "x/y-GGUF", .downloads = 1, .likes = 0, .signin = true }};
     const online = try buildRowsEx(a.allocator(), .discover, inv, &cat, "", .name, false, &hits, .{ .access = .signin });
     try std.testing.expectEqual(@as(usize, 2), online.len);
+}
+
+pub const TagColor = enum { green, cyan, magenta, blue, yellow, red };
+pub const Tag = struct { text: []const u8, color: TagColor };
+
+fn hasUseTag(r: Row, u: []const u8) bool {
+    return hasUse(r, u);
+}
+
+/// Capability tags shown on every row: tools, vision, thinking/reasoning, coding. Installed Ollama models
+/// use what Ollama reports; everything else falls back to the catalog's derived hints.
+pub fn capTags(r: Row, out: *[4]Tag) usize {
+    var n: usize = 0;
+    const add = struct {
+        fn f(o: *[4]Tag, k: *usize, t: Tag) void {
+            if (k.* < o.len) {
+                o[k.*] = t;
+                k.* += 1;
+            }
+        }
+    }.f;
+    if (r.info) |i| {
+        if (i.hasCap("tools")) add(out, &n, .{ .text = "tools", .color = .green });
+        if (i.hasCap("vision")) add(out, &n, .{ .text = "vision", .color = .cyan });
+        if (i.hasCap("thinking")) add(out, &n, .{ .text = "thinking", .color = .magenta });
+    } else {
+        if (hasUseTag(r, "tools")) add(out, &n, .{ .text = "tools", .color = .green });
+        if (hasUseTag(r, "vision")) add(out, &n, .{ .text = "vision", .color = .cyan });
+        if (hasUseTag(r, "reasoning")) add(out, &n, .{ .text = "reasoning", .color = .magenta });
+    }
+    if (hasUseTag(r, "coding")) add(out, &n, .{ .text = "coding", .color = .blue });
+    return n;
+}
+
+pub const ToolSupport = enum { reported_yes, reported_no, catalog_yes, catalog_no, unknown };
+
+/// Whether the model can call tools, and how we know.
+pub fn toolSupport(r: Row) ToolSupport {
+    if (r.info) |i| return if (i.hasCap("tools")) .reported_yes else .reported_no;
+    if (r.entry != null) return if (hasUseTag(r, "tools")) .catalog_yes else .catalog_no;
+    return .unknown;
+}
+
+test "capability tags and tool support" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const inv, var cat = try fixture(a.allocator());
+    var p: catalog.Problem = .{};
+    try cat.load(a.allocator(), std.testing.allocator, "[[model]]\nbackend=\"ollama\"\nid=\"zeta:1b\"\nuse_cases=[\"chat\",\"coding\"]\n", .user, &p);
+    var infos: InfoMap = .empty;
+    try infos.put(a.allocator(), "alpha:7b", .{ .caps = &.{ "completion", "tools", "vision" } });
+    const rows = try buildRowsEx(a.allocator(), .installed, inv, &cat, "", .name, false, &.{}, .{ .infos = &infos });
+    var tags: [4]Tag = undefined;
+    for (rows) |r| {
+        if (std.mem.eql(u8, r.model.id, "alpha:7b")) {
+            try std.testing.expectEqual(ToolSupport.reported_yes, toolSupport(r));
+            try std.testing.expectEqual(@as(usize, 3), capTags(r, &tags)); // tools + vision (reported) + coding (catalog)
+            try std.testing.expectEqualStrings("tools", tags[0].text);
+            try std.testing.expectEqualStrings("coding", tags[2].text);
+        }
+        if (std.mem.eql(u8, r.model.id, "zeta:1b")) {
+            try std.testing.expectEqual(ToolSupport.catalog_no, toolSupport(r));
+            try std.testing.expectEqual(@as(usize, 1), capTags(r, &tags)); // coding only
+        }
+        if (r.model.backend == .llama) try std.testing.expectEqual(ToolSupport.unknown, toolSupport(r));
+    }
 }

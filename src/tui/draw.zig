@@ -10,6 +10,8 @@ const backend_mod = @import("../backend.zig");
 const netstat = @import("../netstat.zig");
 const launcher = @import("../launcher.zig");
 const hardware = @import("../hardware.zig");
+const progress_mod = @import("../progress.zig");
+const agent_policy = @import("../agent/policy.zig");
 const State = @import("state.zig");
 
 const App = State.App;
@@ -102,6 +104,18 @@ fn drawModels(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usize
         if (row.note) |n| try line.print(a, "  ({s})", .{n});
         term.setAttr(if (is_sel) term.A_REVERSE else 0);
         term.put(top + 1 + r, 0, list_w, line.items);
+        // Capability tags (tools / vision / thinking / coding), colored, right after the text.
+        var tags: [4]model.Tag = undefined;
+        const nt = model.capTags(row, &tags);
+        var col: usize = std.unicode.utf8CountCodepoints(line.items) catch line.items.len;
+        for (tags[0..nt]) |t| {
+            if (col + t.text.len + 3 > list_w) break;
+            term.setAttr(tagColor(t.color) | term.A_BOLD | (if (is_sel) term.A_REVERSE else 0));
+            var tb: [24]u8 = undefined;
+            const txt = std.fmt.bufPrint(&tb, " [{s}]", .{t.text}) catch break;
+            term.put(top + 1 + r, col, list_w - col, txt);
+            col += txt.len;
+        }
     }
     term.setAttr(0);
 
@@ -136,87 +150,253 @@ pub fn wrap(a: std.mem.Allocator, text: []const u8, width: usize, out: *std.Arra
     }
 }
 
-fn drawDetail(app: *App, a: std.mem.Allocator, row: model.Row, x: usize, w: usize, top: usize, h: usize) !void {
-    var lines: std.ArrayList([]const u8) = .empty;
-    const inner = if (w > 2) w - 2 else w;
-    const kv = struct {
-        fn add(al: std.mem.Allocator, ls: *std.ArrayList([]const u8), iw: usize, k: []const u8, v: []const u8) !void {
-            const t = try std.fmt.allocPrint(al, "{s}: {s}", .{ k, v });
-            try wrap(al, t, iw, ls);
-        }
+const Line = struct {
+    text: []const u8,
+    /// Bytes of `text` that are the "Label:" part (drawn in the label color).
+    label_len: usize = 0,
+    /// Color for the value part.
+    color: c_int = 0,
+    bold: bool = false,
+};
+
+fn tagColor(c: model.TagColor) c_int {
+    return switch (c) {
+        .green => term.C_GREEN,
+        .cyan => term.C_CYAN,
+        .magenta => term.C_MAGENTA,
+        .blue => term.C_BLUE,
+        .yellow => term.C_YELLOW,
+        .red => term.C_RED,
     };
-    try kv.add(a, &lines, inner, "Name", row.title());
-    try kv.add(a, &lines, inner, "Backend", row.model.backend.name());
-    try kv.add(a, &lines, inner, "Exact ID", row.model.id);
-    try kv.add(a, &lines, inner, "Status", if (row.installed) "installed" else "not installed");
-    if (row.model.size_text) |s| try kv.add(a, &lines, inner, "Size", s);
-    if (row.model.quant) |q| try kv.add(a, &lines, inner, "Quantization", q);
-    if (row.model.modified) |m| try kv.add(a, &lines, inner, "Modified", m);
-    if (row.model.digest) |d| try kv.add(a, &lines, inner, "Digest", d);
+}
+
+fn addKv(al: std.mem.Allocator, ls: *std.ArrayList(Line), iw: usize, k: []const u8, v: []const u8, color: c_int) !void {
+    const t = try std.fmt.allocPrint(al, "{s}: {s}", .{ k, v });
+    var parts: std.ArrayList([]const u8) = .empty;
+    try wrap(al, t, iw, &parts);
+    for (parts.items, 0..) |p, i| try ls.append(al, .{ .text = p, .label_len = if (i == 0) @min(k.len + 1, p.len) else 0, .color = color });
+}
+
+fn addNote(al: std.mem.Allocator, ls: *std.ArrayList(Line), iw: usize, text: []const u8, color: c_int) !void {
+    var parts: std.ArrayList([]const u8) = .empty;
+    try wrap(al, text, iw, &parts);
+    for (parts.items) |p| try ls.append(al, .{ .text = p, .color = color });
+}
+
+fn addHeading(al: std.mem.Allocator, ls: *std.ArrayList(Line), text: []const u8) !void {
+    try ls.append(al, .{ .text = text, .color = term.C_CYAN, .bold = true });
+}
+
+fn gbRange(a: std.mem.Allocator, f: hardware.Fit) ![]const u8 {
+    return std.fmt.allocPrint(a, "about {d:.1}-{d:.1} GB", .{ hardware.gb(f.need_low), hardware.gb(f.need_high) });
+}
+
+fn drawDetail(app: *App, a: std.mem.Allocator, row: model.Row, x: usize, w: usize, top: usize, h: usize) !void {
+    var lines: std.ArrayList(Line) = .empty;
+    const inner = if (w > 2) w - 2 else w;
+    try addKv(a, &lines, inner, "Name", row.title(), 0);
+    try addKv(a, &lines, inner, "Backend", row.model.backend.name(), 0);
+    try addKv(a, &lines, inner, "Exact ID", row.model.id, 0);
+    try addKv(a, &lines, inner, "Status", if (row.installed) "installed" else "not installed", if (row.installed) term.C_GREEN else term.C_YELLOW);
+
+    // Tool use gets its own, always-present line.
+    switch (model.toolSupport(row)) {
+        .reported_yes => try addKv(a, &lines, inner, "Tools", "YES - can call tools (reported by ollama)", term.C_GREEN),
+        .reported_no => try addKv(a, &lines, inner, "Tools", "no - ollama does not report tool support", term.C_YELLOW),
+        .catalog_yes => try addKv(a, &lines, inner, "Tools", "YES - can call tools (catalog hint, derived from the registry)", term.C_GREEN),
+        .catalog_no => try addKv(a, &lines, inner, "Tools", "not indicated by the catalog", term.C_YELLOW),
+        .unknown => try addKv(a, &lines, inner, "Tools", "unknown (this backend does not report it and there is no catalog entry)", 0),
+    }
+    if (row.info) |i| if (i.hasCap("tools") and row.installed) {
+        const lvl = agent_policy.defaultLevel(true, i.paramsB());
+        try addKv(a, &lines, inner, "Agent mode", try std.fmt.allocPrint(a, "available - default level '{s}' for this size (press g; tune with: aimgr agent set)", .{lvl.text()}), term.C_GREEN);
+    };
+    if (row.info) |i| {
+        if (i.caps.len > 0) try addKv(a, &lines, inner, "Capabilities (ollama)", try std.mem.join(a, ", ", i.caps), term.C_GREEN);
+        if (i.architecture) |v| try addKv(a, &lines, inner, "Architecture", v, 0);
+        if (i.parameters) |v| try addKv(a, &lines, inner, "Parameters", v, 0);
+        if (i.context_length) |v| try addKv(a, &lines, inner, "Context length", try std.fmt.allocPrint(a, "{d} tokens", .{v}), 0);
+        if (i.quantization) |v| try addKv(a, &lines, inner, "Quantization", v, 0);
+    } else if (row.model.quant) |q| try addKv(a, &lines, inner, "Quantization", q, 0);
+    if (row.model.size_text) |sz| try addKv(a, &lines, inner, "Size", sz, 0);
+    if (row.model.modified) |m| try addKv(a, &lines, inner, "Modified", m, 0);
+    if (row.model.digest) |d| try addKv(a, &lines, inner, "Digest", d, 0);
     if (row.entry) |e| {
-        if (e.description) |d| try kv.add(a, &lines, inner, "About", d);
-        if (e.use_cases.len > 0) try kv.add(a, &lines, inner, "Good for (derived hints, not benchmarks)", try std.mem.join(a, ", ", e.use_cases));
-        if (e.tags.len > 0) try kv.add(a, &lines, inner, "Tags", try std.mem.join(a, ", ", e.tags));
-        if (e.notes) |n| try kv.add(a, &lines, inner, "Notes", n);
-        try kv.add(a, &lines, inner, "Catalog", @tagName(e.source));
-    } else try kv.add(a, &lines, inner, "Catalog", "no entry (metadata unknown)");
-    if (row.access) |ac| try kv.add(a, &lines, inner, "Access", try std.fmt.allocPrint(a, "{s} - {s}", .{ ac.label(), ac.explain() })) else if (!row.installed) try kv.add(a, &lines, inner, "Access", "unknown (not stated in the catalog)");
-    if (row.abliterated) try wrap(a, catalog.abliterated_note, inner, &lines);
+        if (e.description) |d| try addKv(a, &lines, inner, "About", d, 0);
+        if (e.use_cases.len > 0) try addKv(a, &lines, inner, "Good for (derived hints, not benchmarks)", try std.mem.join(a, ", ", e.use_cases), term.C_GREEN);
+        if (e.tags.len > 0) try addKv(a, &lines, inner, "Tags", try std.mem.join(a, ", ", e.tags), term.C_YELLOW);
+        if (e.notes) |n| try addKv(a, &lines, inner, "Notes", n, 0);
+        try addKv(a, &lines, inner, "Catalog", if (e.origin.len > 0) e.origin else @tagName(e.source), 0);
+    } else try addKv(a, &lines, inner, "Catalog", "no entry (metadata unknown)", 0);
+    if (row.access) |ac| {
+        const col: c_int = switch (ac) {
+            .open => term.C_GREEN,
+            .signin => term.C_YELLOW,
+            .cloud => term.C_RED,
+        };
+        try addKv(a, &lines, inner, "Access", try std.fmt.allocPrint(a, "{s} - {s}", .{ ac.label(), ac.explain() }), col);
+    } else if (!row.installed) try addKv(a, &lines, inner, "Access", "unknown (not stated in the catalog)", 0);
+    if (row.abliterated) try addNote(a, &lines, inner, catalog.abliterated_note, term.C_RED);
+
+    // What it takes to run it decently (advisory ranges).
     {
-        const fit = hardware.estimate(row.model.id, row.model.quant, backend_mod.parseSizeText(row.model.size_text), 4096, app.hw);
-        try kv.add(a, &lines, inner, "Hardware fit (advisory)", fit.verdict.text());
-        if (fit.verdict != .unknown) {
-            try kv.add(a, &lines, inner, "  estimate", try std.fmt.allocPrint(a, "about {d:.1}-{d:.1} GB at 4096 context (weights {d:.1} GB, {s})", .{ hardware.gb(fit.need_low), hardware.gb(fit.need_high), hardware.gb(fit.weights), if (fit.weights_estimated) "estimated from the name and quant" else "as reported" }));
+        const bytes = backend_mod.parseSizeText(row.model.size_text) orelse (if (row.entry) |e| e.size_bytes else null);
+        const params = (if (row.info) |i| i.paramsB() else null) orelse (if (row.entry) |e| e.params_b else null);
+        const quant = (if (row.info) |i| i.quantization else null) orelse row.model.quant;
+        const f4 = hardware.estimateWith(row.model.id, quant, bytes, params, 4096, app.hw);
+        try addHeading(a, &lines, "To run it decently (advisory estimate)");
+        if (f4.verdict == .unknown) {
+            try addNote(a, &lines, inner, "Cannot estimate: neither a size nor a parameter count + quantization is known for this model.", 0);
+        } else {
+            const f32k = hardware.estimateWith(row.model.id, quant, bytes, params, 32768, app.hw);
+            try addKv(a, &lines, inner, "  GPU memory (full speed)", try std.fmt.allocPrint(a, "{s} VRAM at 4096 context", .{try gbRange(a, f4)}), 0);
+            try addKv(a, &lines, inner, "  CPU only (slower)", try std.fmt.allocPrint(a, "{s} free RAM, and expect noticeably lower speed than a GPU", .{try gbRange(a, f4)}), 0);
+            try addKv(a, &lines, inner, "  At 32k context", try std.fmt.allocPrint(a, "{s} (the cache grows with context)", .{try gbRange(a, f32k)}), 0);
+            try addKv(a, &lines, inner, "  Weights", try std.fmt.allocPrint(a, "{d:.1} GB, {s}", .{ hardware.gb(f4.weights), if (f4.weights_estimated) "estimated from the parameter count and quantization" else "as reported" }), 0);
+            const vcol: c_int = switch (f4.verdict) {
+                .fits_gpu, .cpu_ok => term.C_GREEN,
+                .maybe_fits_gpu, .needs_offload => term.C_YELLOW,
+                .unlikely => term.C_RED,
+                .unknown => 0,
+            };
+            try addKv(a, &lines, inner, "On this machine", f4.verdict.text(), vcol);
         }
     }
     if (row.installed) {
-        var all: std.ArrayList(@import("../backend.zig").Model) = .empty;
+        var all: std.ArrayList(backend_mod.Model) = .empty;
         for (app.report.reports) |r| try all.appendSlice(a, r.models orelse &.{});
         for (try manage.duplicates(a, all.items, row.model.backend, row.model.id)) |d| {
-            try kv.add(a, &lines, inner, if (d.exact_id) "Same id in" else "Similar", try std.fmt.allocPrint(a, "{s} {s}", .{ d.model.backend.name(), d.model.id }));
+            try addKv(a, &lines, inner, if (d.exact_id) "Same id in" else "Similar", try std.fmt.allocPrint(a, "{s} {s}", .{ d.model.backend.name(), d.model.id }), 0);
         }
-        if (manage.unsupportedReason(row.model.backend, .remove)) |why| try kv.add(a, &lines, inner, "Delete disabled", why);
+        if (manage.unsupportedReason(row.model.backend, .remove)) |why| try addKv(a, &lines, inner, "Delete disabled", why, 0);
     }
     for (lines.items, 0..) |l, i| {
         if (i >= h) break;
-        term.put(top + i, x + 1, inner, l);
+        const lab = @min(l.label_len, l.text.len);
+        if (lab > 0) {
+            term.setAttr(term.A_BOLD | term.C_CYAN);
+            term.put(top + i, x + 1, inner, l.text[0..lab]);
+            term.setAttr(l.color | (if (l.bold) term.A_BOLD else 0));
+            const off = std.unicode.utf8CountCodepoints(l.text[0..lab]) catch lab;
+            if (inner > off) term.put(top + i, x + 1 + off, inner - off, l.text[lab..]);
+        } else {
+            term.setAttr(l.color | (if (l.bold) term.A_BOLD else 0));
+            term.put(top + i, x + 1, inner, l.text);
+        }
     }
+    term.setAttr(0);
+}
+
+/// "[=====>      ]  45%" (ASCII bar + percent; the percent is always printed, so no glyph or
+/// color is needed to read it). Indeterminate jobs get a sliding block.
+fn jobBar(a: std.mem.Allocator, j: jobs.Job, width: usize, tick: u64) ![]const u8 {
+    var buf: [96]u8 = undefined;
+    if (j.progress) |pr| {
+        if (pr.fraction()) |f| {
+            const b = progress_mod.bar(&buf, width, f);
+            return std.fmt.allocPrint(a, "{s} {d:>3}%", .{ b, pr.percent().? });
+        }
+    }
+    if (j.state == .done) return std.fmt.allocPrint(a, "{s} 100%", .{progress_mod.bar(&buf, width, 1.0)});
+    if (j.isActive()) return std.fmt.allocPrint(a, "{s}  ...", .{progress_mod.spinnerBar(&buf, width, tick)});
+    return "";
+}
+
+fn fmtBytes(a: std.mem.Allocator, n: u64) ![]const u8 {
+    const f: f64 = @floatFromInt(n);
+    if (n >= 1_000_000_000) return std.fmt.allocPrint(a, "{d:.2} GB", .{f / 1e9});
+    if (n >= 1_000_000) return std.fmt.allocPrint(a, "{d:.1} MB", .{f / 1e6});
+    return std.fmt.allocPrint(a, "{d} KB", .{n / 1000});
 }
 
 fn drawJobs(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usize) !void {
     const vis = try app.visibleJobs(a);
     const sel = clampSel(app, vis.len);
-    term.setAttr(term.A_BOLD);
-    term.put(top, 0, cols, if (app.tab == .servers) "Servers (started by aimgr)" else "Transfers (pull / update / remove)");
+    term.setAttr(term.A_BOLD | term.C_CYAN);
+    term.put(top, 0, cols, if (app.tab == .servers) "Servers (started by aimgr)" else "Transfers (pull / update / remove / abliterate)");
     term.setAttr(0);
     if (vis.len == 0) {
         term.put(top + 2, 2, cols, if (app.tab == .servers) "No servers. Select a model on Installed and press s." else "No transfers. Press d on Discover or u / x on Installed.");
         return;
     }
+    const bar_w: usize = if (cols >= 100) 24 else if (cols >= 80) 14 else 10;
     var r: usize = 0;
     while (r < vis.len and r < h / 2) : (r += 1) {
         const j = app.jobs.list.items[vis[r]];
-        var line: std.ArrayList(u8) = .empty;
         const status = if (j.kind == .server and j.state == .running) (if (j.listening) "LISTENING" else "STARTING") else stateWord(j.state);
-        try line.print(a, "{s}#{d} {s:<10} {s:<10} {s:<6} {s}", .{ if (r == sel) "> " else "  ", j.id, status, @tagName(j.kind), j.backend.name(), if (j.model.len > 0) j.model else if (j.kind == .server) "(daemon)" else "(environment)" });
+        const has_bar = j.kind != .server and j.kind != .remove and j.kind != .search;
+        const bar_txt = if (has_bar) try jobBar(a, j, bar_w, app.jobs.tick / 2) else "";
+        // The model name gives way so the bar always fits at the right edge.
+        const name_full = if (j.model.len > 0) j.model else if (j.kind == .server) "(daemon)" else "(environment)";
+        const prefix = try std.fmt.allocPrint(a, "{s}#{d} {s:<10} {s:<10} {s:<6} ", .{ if (r == sel) "> " else "  ", j.id, status, @tagName(j.kind), j.backend.name() });
+        const reserve: usize = if (bar_txt.len > 0) bar_txt.len + 2 else 0;
+        const avail = cols -| (prefix.len + reserve);
+        const name_shown = if (name_full.len <= avail) name_full else if (avail > 4) try std.fmt.allocPrint(a, "{s}...", .{name_full[0 .. avail - 3]}) else "";
+        var line: std.ArrayList(u8) = .empty;
+        try line.print(a, "{s}{s}", .{ prefix, name_shown });
         if (j.port) |p| try line.print(a, " :{d}", .{p});
-        term.setAttr(if (r == sel) term.A_REVERSE else 0);
+        const sel_attr: c_int = if (r == sel) term.A_REVERSE else 0;
+        const state_color: c_int = switch (j.state) {
+            .running, .stopping => term.C_YELLOW,
+            .done => term.C_GREEN,
+            .failed => term.C_RED,
+            .cancelled => term.C_MAGENTA,
+        };
+        term.setAttr(sel_attr);
         term.put(top + 1 + r, 0, cols, line.items);
+        // Re-draw the status word in its color on top of the plain text.
+        term.setAttr(sel_attr | state_color | term.A_BOLD);
+        const sp = std.mem.indexOf(u8, line.items, status) orelse 0;
+        term.put(top + 1 + r, sp, status.len, status);
+        if (bar_txt.len > 0) {
+            term.setAttr(sel_attr | (if (j.state == .done) term.C_GREEN else term.C_CYAN));
+            term.put(top + 1 + r, cols -| (bar_txt.len + 1), bar_txt.len, bar_txt);
+        }
     }
     term.setAttr(0);
     const j = app.jobs.list.items[vis[sel]];
     var y = top + 2 + @min(vis.len, h / 2);
+
+    // Detail: big bar + numbers for the selected job.
+    if (j.kind != .server and j.kind != .remove and j.kind != .search) {
+        const wide_bar = @min(cols -| 24, 50);
+        const bt = try jobBar(a, j, @max(wide_bar, 10), app.jobs.tick / 2);
+        if (bt.len > 0 and y < top + h) {
+            term.setAttr(term.A_BOLD | term.C_CYAN);
+            term.put(y, 2, 10, "Progress: ");
+            term.setAttr(if (j.state == .done) term.C_GREEN else term.C_YELLOW);
+            term.put(y, 12, cols -| 12, bt);
+            term.setAttr(0);
+            y += 1;
+        }
+        if (j.progress) |pr| if (pr.total > 0 and y < top + h) {
+            const txt = switch (pr.unit) {
+                .bytes => try std.fmt.allocPrint(a, "{s} of {s}", .{ try fmtBytes(a, @min(pr.done, pr.total)), try fmtBytes(a, pr.total) }),
+                .steps => "stage-based estimate (see the latest output below)",
+            };
+            term.put(y, 12, cols -| 12, txt);
+            y += 1;
+        } else if (pr.unit == .bytes and y < top + h) {
+            term.put(y, 12, cols -| 12, try std.fmt.allocPrint(a, "{s} downloaded (total size unknown)", .{try fmtBytes(a, pr.done)}));
+            y += 1;
+        };
+    }
+
     var cmd: std.ArrayList(u8) = .empty;
     for (j.argv) |arg| try cmd.print(a, "{s} ", .{arg});
-    const info = [_][]const u8{
-        try std.fmt.allocPrint(a, "Command: {s}", .{cmd.items}),
-        try std.fmt.allocPrint(a, "Log: {s}", .{j.log_path}),
-        try std.fmt.allocPrint(a, "Latest output: {s}", .{if (j.last_line.len > 0) j.last_line else "(none yet)"}),
-        if (j.exit_code) |c| try std.fmt.allocPrint(a, "Exit code: {d}", .{c}) else "Exit code: (running)",
+    const Item = struct { label: []const u8, value: []const u8 };
+    const info = [_]Item{
+        .{ .label = "Command: ", .value = cmd.items },
+        .{ .label = "Log: ", .value = j.log_path },
+        .{ .label = "Latest output: ", .value = if (j.last_line.len > 0) j.last_line else "(none yet)" },
+        .{ .label = "Exit code: ", .value = if (j.exit_code) |c| try std.fmt.allocPrint(a, "{d}", .{c}) else "(running)" },
     };
-    for (info) |s| {
+    for (info) |it| {
         if (y >= top + h) break;
-        term.put(y, 2, cols - 2, s);
+        term.setAttr(term.A_BOLD | term.C_CYAN);
+        term.put(y, 2, it.label.len, it.label);
+        term.setAttr(0);
+        term.put(y, 2 + it.label.len, cols -| (2 + it.label.len), it.value);
         y += 1;
     }
 }
@@ -291,6 +471,7 @@ fn drawHelp(cols: usize, top: usize, h: usize) void {
         "  t                     cycle the good-for filter (coding, reasoning, vision, tools, ...)",
         "  f                     cycle the access filter (open / sign-in / cloud)",
         "  c                     chat with selected installed model (leaves and returns to the TUI)",
+        "  g                     agent: let a tool-capable model look at a directory (asks before anything but reads)",
         "  s                     start API server for selected model (localhost only)",
         "  d                     download selected Discover model (network, confirmed)",
         "  n                     Discover: search Hugging Face for GGUF models (network, runs as a job)",
@@ -299,6 +480,7 @@ fn drawHelp(cols: usize, top: usize, h: usize) void {
         "  x                     delete installed model; on Transfers/Servers: stop job",
         "  b                     abliterate: make a refusal-removed copy of a Hugging Face model (job)",
         "  r                     refresh inventory",
+        "  Ctrl-L                repaint the whole screen (if the terminal shows stray characters)",
         "  ?                     this help",
         "  q                     quit",
         "",
@@ -327,7 +509,7 @@ fn drawStatus(app: *App, rows: usize, cols: usize) void {
         term.setAttr(0);
     }
     const hint = switch (app.tab) {
-        .installed => "c chat  s serve  u update  x delete  t good-for  f access  b abliterate  ? keys  q quit",
+        .installed => "c chat  g agent  s serve  u update  x delete  t good-for  b abliterate  ? keys  q quit",
         .discover => "d download  n search  N browse  t good-for  f access  b abliterate  ? keys  q quit",
         .transfers, .servers => "x stop  r refresh  ? help  q quit",
         .settings => "r refresh  ? help  q quit",

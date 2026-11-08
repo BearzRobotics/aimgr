@@ -9,6 +9,14 @@ const vaxis = @import("vaxis");
 
 pub const A_BOLD: c_int = 1;
 pub const A_REVERSE: c_int = 2;
+/// Foreground colors (ANSI 1-6) in bits 8-15. Ignored when NO_COLOR is set; color is only ever an
+/// accent on top of text, never the sole carrier of meaning.
+pub const C_RED: c_int = 1 << 8;
+pub const C_GREEN: c_int = 2 << 8;
+pub const C_YELLOW: c_int = 3 << 8;
+pub const C_BLUE: c_int = 4 << 8;
+pub const C_MAGENTA: c_int = 5 << 8;
+pub const C_CYAN: c_int = 6 << 8;
 
 pub const Key = union(enum) {
     none,
@@ -27,6 +35,8 @@ pub const Key = union(enum) {
     tab,
     /// Ctrl-C: raw mode turns it into a key rather than SIGINT.
     ctrl_c,
+    /// Ctrl-L: repaint everything.
+    redraw,
     char: u21,
 };
 
@@ -45,10 +55,12 @@ var gpa_: std.mem.Allocator = undefined;
 var io_: std.Io = undefined;
 var active = false;
 var style: vaxis.Style = .{};
+var colors_on = false;
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map) !void {
     gpa_ = gpa;
     io_ = io;
+    colors_on = environ.get("NO_COLOR") == null;
     frame_arena = std.heap.ArenaAllocator.init(gpa);
     errdefer frame_arena.deinit();
     tty = try vaxis.Tty.init(io, &tty_buf);
@@ -102,7 +114,15 @@ pub fn size() struct { rows: usize, cols: usize } {
 
 pub fn erase() void {
     _ = frame_arena.reset(.retain_capacity);
-    vx.window().clear();
+    // Write explicit spaces instead of "default" cells: default cells are rendered with erase
+    // sequences, which some terminals do not apply to every cell (stale text then shows through
+    // the blank gaps between drawn labels).
+    vx.window().fill(.{ .char = .{ .grapheme = " ", .width = 1 } });
+}
+
+/// Force the next render to repaint every cell.
+pub fn redraw() void {
+    vx.queueRefresh();
 }
 
 pub fn flush() void {
@@ -111,7 +131,12 @@ pub fn flush() void {
 }
 
 pub fn setAttr(attr: c_int) void {
-    style = .{ .bold = attr & A_BOLD != 0, .reverse = attr & A_REVERSE != 0 };
+    const fg: u8 = @intCast((attr >> 8) & 0xff);
+    style = .{
+        .bold = attr & A_BOLD != 0,
+        .reverse = attr & A_REVERSE != 0,
+        .fg = if (colors_on and fg != 0) .{ .index = fg } else .default,
+    };
 }
 
 // libvaxis cells keep slices of the text they were given until the next
@@ -162,6 +187,7 @@ pub fn getKey() Key {
 
 fn mapKey(k: vaxis.Key) Key {
     if (k.matches('c', .{ .ctrl = true })) return .ctrl_c;
+    if (k.matches('l', .{ .ctrl = true })) return .redraw;
     return switch (k.codepoint) {
         vaxis.Key.up => .up,
         vaxis.Key.down => .down,

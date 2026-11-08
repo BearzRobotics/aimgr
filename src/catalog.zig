@@ -51,7 +51,14 @@ pub const Entry = struct {
     tags: []const []const u8 = &.{},
     /// null = not stated in the catalog.
     access: ?Access = null,
+    /// Download size in bytes (registry manifest) / parameter count in billions / max context
+    /// tokens, when the generator could read them. Used for the "to run decently" estimates.
+    size_bytes: ?u64 = null,
+    params_b: ?f64 = null,
+    context: ?u64 = null,
     source: Source = .bundled,
+    /// Id of the source this entry came from (e.g. "bundled", "team"); empty if unknown.
+    origin: []const u8 = "",
 };
 
 pub const LoadError = error{ InvalidCatalog, OutOfMemory };
@@ -66,9 +73,14 @@ pub const Catalog = struct {
     /// Lookup order: earlier entries win. Overlay entries go first.
     entries: std.ArrayList(Entry) = .empty,
 
-    /// Parse `text` and add its entries. `prepend` puts them ahead of existing
-    /// ones (used for the user overlay). On failure nothing is added.
+    /// Parse `text` and add its entries. A `.user` source is placed ahead of existing
+    /// entries (overlay semantics); anything else is appended.
     pub fn load(self: *Catalog, arena: std.mem.Allocator, gpa: std.mem.Allocator, text: []const u8, source: Source, problem: *Problem) LoadError!void {
+        return self.loadWith(arena, gpa, text, source, @tagName(source), source == .user, problem);
+    }
+
+    /// Like `load`, with an explicit origin id and placement. On failure nothing is added.
+    pub fn loadWith(self: *Catalog, arena: std.mem.Allocator, gpa: std.mem.Allocator, text: []const u8, source: Source, origin: []const u8, prepend: bool, problem: *Problem) LoadError!void {
         var diag: toml.Diagnostic = .{};
         var doc = toml.Document.parse(gpa, text, .{}, &diag) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -79,18 +91,19 @@ pub const Catalog = struct {
         };
         defer doc.deinit();
 
+        const origin_copy = try arena.dupe(u8, origin);
         var parsed: std.ArrayList(Entry) = .empty;
         defer parsed.deinit(gpa);
         if (doc.root.get("model")) |mv| {
             if (mv != .array) return fail(problem, "'model' must be an array of tables ([[model]])");
             for (mv.array.items.items) |item| {
                 if (item != .table) return fail(problem, "each [[model]] must be a table");
-                const e = try parseEntry(arena, item.table, source, problem);
+                var e = try parseEntry(arena, item.table, source, problem);
+                e.origin = origin_copy;
                 try parsed.append(gpa, e);
             }
         }
-        // Overlay (user) entries take priority over what is already loaded.
-        if (source == .user) {
+        if (prepend) {
             try self.entries.insertSlice(arena, 0, parsed.items);
         } else {
             try self.entries.appendSlice(arena, parsed.items);
@@ -129,6 +142,9 @@ fn parseEntry(arena: std.mem.Allocator, t: *const toml.Table, source: Source, pr
         .use_cases = try strings(arena, t, "use_cases", problem),
         .aliases = try strings(arena, t, "aliases", problem),
         .tags = try strings(arena, t, "tags", problem),
+        .size_bytes = if (t.getInt("size_bytes")) |v| (if (v > 0) @as(u64, @intCast(v)) else null) else null,
+        .params_b = t.getFloat("params_b") orelse (if (t.getInt("params_b")) |v| @as(f64, @floatFromInt(v)) else null),
+        .context = if (t.getInt("context")) |v| (if (v > 0) @as(u64, @intCast(v)) else null) else null,
         .access = if (t.getString("access")) |a| (std.meta.stringToEnum(Access, a) orelse return fail(problem, "unknown access (expected \"open\", \"signin\" or \"cloud\")")) else null,
         .source = source,
     };
@@ -174,7 +190,7 @@ pub fn isAbliterated(id: []const u8, entry: ?*const Entry) bool {
 
 pub const abliterated_note = "Abliterated: refusal behavior was removed by editing weights. Outputs are not filtered by the model; detection here is by tag or name and is not verified.";
 
-const bundled_text = @embedFile("models_toml");
+pub const bundled_text = @embedFile("models_toml");
 
 pub fn loadBundled(arena: std.mem.Allocator, gpa: std.mem.Allocator, cat: *Catalog, problem: *Problem) LoadError!void {
     return cat.load(arena, gpa, bundled_text, .bundled, problem);

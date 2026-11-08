@@ -29,6 +29,15 @@ Model management
 - Catalog search optional, explicit and network-dependent. No auto-pull.
 - Show progress and errors from subprocesses; cancellation sends graceful termination then escalation with user approval.
 - Confirm deletion with exact backend and identifier; warn when duplicates exist.
+Agent mode (tool use)
+- `aimgr agent <backend> <model> [--dir DIR]...` lets a tool-capable model inspect the computer through a fixed set of tools (list_dir, read_file, search, stat, run_command, write_file) in a loop: the model asks, aimgr decides, aimgr executes and returns the result.
+- Only models that report tool support (Ollama capability `tools`, or catalog `tools` hint) are offered. Ollama is supported first; llama server support is planned.
+- Every request goes through the policy engine (section 6). Nothing the model writes can approve itself: approvals come only from the user's keypress, and the prompt shows the exact argv/path/diff, never the model's description of it.
+- Autonomy is a per-model setting ("level"): `off` (chat only), `read-only` (file tools inside the allowed directories), `inspect` (adds an allowlist of read-only commands), `ask` (adds any other command or file write, each needing approval). Defaults are derived from what the model can do (no tools -> off; small models -> read-only; mid-size -> inspect; large -> ask) and every default can be overridden per model: level, allowed directories, step limit, command timeout, output cap, extra allowed read-only commands, sandbox, and whether root commands may even be requested.
+- Commands run as argument vectors, never through a shell; a plan that needs a pipe or `&&` is split into separately approved steps. Optional `bwrap` (bubblewrap) sandbox: read-only view of the allowed directories, no network.
+- Privilege escalation (`sudo`, `su`, `doas`, `pkexec`) and shell interpreters (`sh -c`, `bash -c`, ...) are denied unless the model's setting `allow_root` is explicitly true, in which case they are still approval-gated with a warning.
+- Every tool request, decision (auto/asked/denied/approved) and result size is appended to an audit log in the state directory.
+- File and command output returned to the model is untrusted data (prompt injection): it can never raise the autonomy level or approve an action.
 TUI
 - Tabs: Installed, Discover, Transfers, Servers, Settings.
 - Keyboard: arrows/j/k, Enter, / search, c CLI, s server, d download, u update, x delete, r refresh, q quit.
@@ -49,6 +58,7 @@ Hardware
 - src/process.zig: safe argv process execution and supervision.
 - src/launcher.zig: launch profiles and validation.
 - src/hardware.zig: RAM/VRAM inspection.
+- src/agent/: agent mode (policy.zig: command/path classification; tools.zig: tool schemas and execution with limits; chat.zig: Ollama chat API with tools; run.zig: the loop, approvals, audit log). Per-model settings live in config.toml.
 - src/tui/: terminal interface (term.zig backend wrapper, model, draw, app, jobs).
 - src/config.zig: user settings and XDG paths.
 - config/models.toml: bundled seed descriptions.
@@ -57,13 +67,14 @@ Backend interface concepts: probe, list, pull, remove, launch_chat, launch_serve
 - User config: $XDG_CONFIG_HOME/aimgr/config.toml or ~/.config/aimgr/config.toml.
 - User catalog overlay: $XDG_CONFIG_HOME/aimgr/models.toml.
 - Cache/state: XDG cache/state locations, not model blob duplication.
+- Per-model agent settings: `[[agent]]` tables in config.toml (backend, id, level, dirs, max_steps, timeout_s, max_output_kb, allow_commands, sandbox, allow_root).
 - Backend profiles stored separately; retain user overrides across catalog updates.
 - TOML parser must be vendored and pinned, or implemented internally; never silently fetch dependencies during build.
 6. Security
 - No shell interpolation for identifiers, paths or arguments; spawn via argv.
 - Confirm destructive operations and public server binding.
 - Treat model metadata, catalog results, and subprocess output as untrusted data.
-- Never auto-execute model-supplied instructions.
+- Never auto-execute model-supplied instructions, with one bounded exception: agent mode (section 3). There, read-only operations inside the user-chosen directories (and, at level `inspect`, allowlisted read-only commands) run without a prompt; everything else needs per-action approval or is denied outright. The policy engine is a pure, unit-tested module (src/agent/policy.zig); the model cannot change its own level, directories or allowlists.
 - Protect terminal state on errors and signals; avoid logging secrets.
 - Avoid arbitrary model-file deletion; use supported backend operations.
 7. Build and dependencies
@@ -87,6 +98,7 @@ Backend interface concepts: probe, list, pull, remove, launch_chat, launch_serve
 - Pull/update/remove show exact backend and do not operate on another backend's storage.
 - Unsupported llama deletion is disabled rather than guessed.
 - Parser fixtures and process error cases are tested.
+- Agent mode: a model without tool support is refused; read-only requests inside the allowed directories run without a prompt; writes, deletions, unknown commands and anything outside the directories are asked or denied; sudo/su and shell interpreters are denied by default; the audit log records every request; policy tests cover traversal, symlinks and argument tricks.
 - TUI remains responsive during long downloads and handles resize and cancellation.
 10. Open validation items
 - Capture llama ls --help, llama ls, llama pull --help, llama serve --help from installed version.

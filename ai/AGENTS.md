@@ -5,7 +5,7 @@ Engineering rules
 1. Read spec.md and this file before modifying code. Record material design decisions and rationale under docs/decisions/.
 2. Verify command flags and output formats against actual installed tools or captured fixtures. Do not invent backend features or assume output formats are stable.
 3. Prefer Zig standard library; vendor and pin all source dependencies (currently toml-zig, libvaxis, uucode). No system libraries are required.
-4. No shell command construction using user/model strings. Always use argument vectors.
+4. No shell command construction using user/model strings. Always use argument vectors. In agent mode the model's requests are data for the policy engine, never instructions to aimgr; do not add any path by which model output raises autonomy or approves an action.
 5. Never delete model blobs, shared caches, or directories directly. Use documented backend deletion APIs or disable the operation.
 6. No unexpected network access, automatic downloads, telemetry, or public server bindings.
 7. Make failure visible: distinguish missing executables, bad output, incompatible versions, network errors, and permission failures.

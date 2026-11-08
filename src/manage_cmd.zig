@@ -5,6 +5,9 @@ const inventory = @import("inventory.zig");
 const manage = @import("manage.zig");
 const supervise = @import("supervise.zig");
 const catalog_io = @import("catalog_io.zig");
+const dlwatch = @import("dlwatch.zig");
+const sources_io = @import("sources_io.zig");
+const sources = @import("sources.zig");
 
 const Opts = struct { kind: backend.Kind, id: []const u8, yes: bool = false, dry_run: bool = false };
 
@@ -104,7 +107,27 @@ pub fn run(e: supervise.Env, report: inventory.Inventory, arena: std.mem.Allocat
             return 1;
         }
     }
-    const code = try supervise.runTransfer(e, argv, @tagName(action));
+    var watch: ?supervise.Watch = null;
+    if (o.kind == .llama and action != .remove) watch = try llamaWatch(arena, e, o.id);
+    const code = try supervise.runTransferWatch(e, argv, null, @tagName(action), watch);
     if (code == 0) try e.out.print("{s}: done ({s} {s})\n", .{ @tagName(action), o.kind.name(), o.id }) else try e.err.print("aimgr: {s} failed with exit code {d}\n", .{ @tagName(action), code });
     return code;
+}
+
+/// Progress watch for `llama download -hf`: expected size from the (first enabled) Hugging Face
+/// source's API, bytes so far from the hub cache. Best effort; without a total the bar shows bytes.
+fn llamaWatch(arena: std.mem.Allocator, e: supervise.Env, id: []const u8) !?supervise.Watch {
+    const hub = (try dlwatch.hubCacheDir(arena, e.environ)) orelse return null;
+    const parts = dlwatch.splitId(id);
+    var endpoint: []const u8 = sources.default_hf_endpoint;
+    if (sources_io.load(arena, e.gpa, e.io, e.environ) catch null) |l| for (l.list) |s| {
+        if (s.kind == .huggingface and s.enabled) {
+            endpoint = s.endpoint();
+            break;
+        }
+    };
+    try e.out.print("checking the download size on {s} (network)...\n", .{endpoint});
+    try e.out.flush();
+    const total = dlwatch.expectedSize(arena, e.gpa, e.io, endpoint, parts) orelse 0;
+    return .{ .dir = try dlwatch.blobsDir(arena, hub, parts.repo), .total = total };
 }

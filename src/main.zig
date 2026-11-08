@@ -9,6 +9,8 @@ const usage =
     \\
     \\commands:
     \\  tui      interactive interface (default when run in a terminal)
+    \\  agent    let a tool-capable model inspect files / run commands under guardrails: agent <ollama> <model> --dir DIR | show | set | settings | reset
+    \\  sources  manage where models are discovered: sources [list] | add <kind> <id> [<location>] | enable|disable|remove <id> | refresh [<id>]
     \\  search   search Hugging Face for GGUF models (network, only when you run it): search <text> [--limit N]
     \\  browse   list GGUF models without a query (network, only when you run it): browse [--sort trending|downloads|recent] [--limit N]
     \\  hardware show RAM and GPUs found, and what the fit estimates are based on
@@ -63,10 +65,15 @@ pub fn main(init: std.process.Init) !u8 {
                 break :blk 1;
             };
         }
+    } else if (std.mem.eql(u8, cmd, "agent")) {
+        const report = inv.discover(arena, init.gpa, io);
+        code = try aimgr.agent_cmd.main(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "sources")) {
+        code = try aimgr.sources_cmd.run(arena, init.gpa, io, init.environ_map, out, err, args[2..]);
     } else if (std.mem.eql(u8, cmd, "search")) {
-        code = try runSearch(arena, init.gpa, io, out, err, args[2..]);
+        code = try runSearch(arena, init.gpa, io, init.environ_map, out, err, args[2..]);
     } else if (std.mem.eql(u8, cmd, "browse")) {
-        code = try runBrowse(arena, init.gpa, io, out, err, args[2..]);
+        code = try runBrowse(arena, init.gpa, io, init.environ_map, out, err, args[2..]);
     } else if (std.mem.eql(u8, cmd, "hardware")) {
         const hw = try aimgr.hardware.detect(arena, init.gpa, io);
         try out.print("RAM: {d:.1} GB total, {d:.1} GB available\n", .{ aimgr.hardware.gb(hw.mem.total), aimgr.hardware.gb(hw.mem.available) });
@@ -244,9 +251,37 @@ fn printList(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, out: 
     return code;
 }
 
-fn runSearch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, err: *std.Io.Writer, args: []const [:0]const u8) !u8 {
+/// Enabled online sources, optionally restricted to one id.
+fn onlineSources(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, only: ?[]const u8, err: *std.Io.Writer) !?[]aimgr.sources.Source {
+    const loaded = try aimgr.sources_io.load(arena, gpa, io, env);
+    if (loaded.warning) |w| try err.print("aimgr: {s}\n", .{w});
+    var picked: std.ArrayList(aimgr.sources.Source) = .empty;
+    for (loaded.list) |src| {
+        if (!src.kind.isOnline()) continue;
+        if (only) |o| {
+            if (!std.mem.eql(u8, o, src.id)) continue;
+        } else if (!src.enabled) continue;
+        if (only != null and !src.enabled) {
+            try err.print("aimgr: source '{s}' is disabled (aimgr sources enable {s})\n", .{ src.id, src.id });
+            return null;
+        }
+        try picked.append(arena, src);
+    }
+    if (picked.items.len == 0) {
+        try err.writeAll(if (only != null) "aimgr: no such online source (see 'aimgr sources')\n" else "aimgr: no enabled online source; enable one with 'aimgr sources enable huggingface'\n");
+        return null;
+    }
+    return try picked.toOwnedSlice(arena);
+}
+
+fn printHit(out: *std.Io.Writer, r: aimgr.discover.Result, source_id: []const u8) !void {
+    try out.print("llama\t{s}\tdownloads={d}\tlikes={d}\tsource={s}{s}{s}\n", .{ r.id, r.downloads, r.likes, source_id, if (r.gated) "\taccess=signin" else "", if (aimgr.catalog.isAbliterated(r.id, null)) "\t[abliterated]" else "" });
+}
+
+fn runSearch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, out: *std.Io.Writer, err: *std.Io.Writer, args: []const [:0]const u8) !u8 {
     var query: ?[]const u8 = null;
     var limit: u32 = 15;
+    var only: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--limit")) {
@@ -254,33 +289,47 @@ fn runSearch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, out: 
             if (i >= args.len) return searchUsage(err);
             limit = std.fmt.parseInt(u32, args[i], 10) catch return searchUsage(err);
             if (limit == 0 or limit > 100) return searchUsage(err);
+        } else if (std.mem.eql(u8, args[i], "--source")) {
+            i += 1;
+            if (i >= args.len) return searchUsage(err);
+            only = args[i];
         } else if (query == null and !std.mem.startsWith(u8, args[i], "--")) {
             query = args[i];
         } else return searchUsage(err);
     }
     const q = query orelse return searchUsage(err);
-    try out.print("searching huggingface.co for GGUF models matching \"{s}\" (network)...\n", .{q});
-    try out.flush();
-    const results = aimgr.discover.search(arena, gpa, io, q, limit) catch |e| {
-        try err.print("aimgr: search failed: {s}\n", .{aimgr.discover.errorText(e)});
-        return 1;
-    };
-    if (results.len == 0) try out.writeAll("no results\n");
-    for (results) |r| {
-        try out.print("llama\t{s}\tdownloads={d}\tlikes={d}{s}{s}\n", .{ r.id, r.downloads, r.likes, if (r.gated) "\taccess=signin" else "", if (aimgr.catalog.isAbliterated(r.id, null)) "\t[abliterated]" else "" });
+    const targets = (try onlineSources(arena, gpa, io, env, only, err)) orelse return 1;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var code: u8 = 0;
+    var total: usize = 0;
+    for (targets) |t| {
+        try out.print("searching {s} for GGUF models matching \"{s}\" (network, source '{s}')...\n", .{ t.endpoint(), q, t.id });
+        try out.flush();
+        const results = aimgr.discover.search(arena, gpa, io, t.endpoint(), q, limit) catch |e| {
+            try err.print("aimgr: source '{s}': search failed: {s}\n", .{ t.id, aimgr.discover.errorText(e) });
+            code = 1;
+            continue;
+        };
+        for (results) |r| {
+            if ((try seen.getOrPut(arena, r.id)).found_existing) continue;
+            total += 1;
+            try printHit(out, r, t.id);
+        }
     }
-    if (results.len > 0) try out.writeAll("download with: aimgr pull llama <id>[:QUANT]   (default quant Q4_K_M; see 'aimgr hardware' for what fits)\n");
-    return 0;
+    if (total == 0 and code == 0) try out.writeAll("no results\n");
+    if (total > 0) try out.writeAll("download with: aimgr pull llama <id>[:QUANT]   (default quant Q4_K_M; see 'aimgr hardware' for what fits)\n");
+    return code;
 }
 
 fn searchUsage(err: *std.Io.Writer) !u8 {
-    try err.writeAll("usage: aimgr search <text> [--limit 1-100]\n");
+    try err.writeAll("usage: aimgr search <text> [--limit 1-100] [--source ID]\n");
     return 2;
 }
 
-fn runBrowse(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, err: *std.Io.Writer, args: []const [:0]const u8) !u8 {
+fn runBrowse(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, out: *std.Io.Writer, err: *std.Io.Writer, args: []const [:0]const u8) !u8 {
     var sort: aimgr.discover.Sort = .trending;
     var limit: u32 = 30;
+    var only: ?[]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         if (i + 1 >= args.len) return browseUsage(err);
@@ -289,22 +338,33 @@ fn runBrowse(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, out: 
         } else if (std.mem.eql(u8, args[i], "--limit")) {
             limit = std.fmt.parseInt(u32, args[i + 1], 10) catch return browseUsage(err);
             if (limit == 0 or limit > 100) return browseUsage(err);
+        } else if (std.mem.eql(u8, args[i], "--source")) {
+            only = args[i + 1];
         } else return browseUsage(err);
     }
-    try out.print("browsing huggingface.co GGUF text-generation models, sorted by {s} (network)...\n", .{@tagName(sort)});
-    try out.flush();
-    const results = aimgr.discover.browse(arena, gpa, io, sort, limit) catch |e| {
-        try err.print("aimgr: browse failed: {s}\n", .{aimgr.discover.errorText(e)});
-        return 1;
-    };
-    for (results) |r| {
-        try out.print("llama\t{s}\tdownloads={d}\tlikes={d}{s}{s}\n", .{ r.id, r.downloads, r.likes, if (r.gated) "\taccess=signin" else "", if (aimgr.catalog.isAbliterated(r.id, null)) "\t[abliterated]" else "" });
+    const targets = (try onlineSources(arena, gpa, io, env, only, err)) orelse return 1;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    var code: u8 = 0;
+    var total: usize = 0;
+    for (targets) |t| {
+        try out.print("browsing {s} GGUF text-generation models, sorted by {s} (network, source '{s}')...\n", .{ t.endpoint(), @tagName(sort), t.id });
+        try out.flush();
+        const results = aimgr.discover.browse(arena, gpa, io, t.endpoint(), sort, limit) catch |e| {
+            try err.print("aimgr: source '{s}': browse failed: {s}\n", .{ t.id, aimgr.discover.errorText(e) });
+            code = 1;
+            continue;
+        };
+        for (results) |r| {
+            if ((try seen.getOrPut(arena, r.id)).found_existing) continue;
+            total += 1;
+            try printHit(out, r, t.id);
+        }
     }
-    if (results.len > 0) try out.writeAll("these are unvetted third-party repositories; check the model card. download with: aimgr pull llama <id>[:QUANT]\n");
-    return 0;
+    if (total > 0) try out.writeAll("these are unvetted third-party repositories; check the model card. download with: aimgr pull llama <id>[:QUANT]\n");
+    return code;
 }
 
 fn browseUsage(err: *std.Io.Writer) !u8 {
-    try err.writeAll("usage: aimgr browse [--sort trending|downloads|recent] [--limit 1-100]\n");
+    try err.writeAll("usage: aimgr browse [--sort trending|downloads|recent] [--limit 1-100] [--source ID]\n");
     return 2;
 }

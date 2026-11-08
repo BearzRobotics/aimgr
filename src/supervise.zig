@@ -4,6 +4,7 @@
 const std = @import("std");
 const launcher = @import("launcher.zig");
 const netstat = @import("netstat.zig");
+const dlwatch = @import("dlwatch.zig");
 
 var stop_requested = std.atomic.Value(u8).init(0);
 
@@ -127,6 +128,20 @@ pub fn runTransfer(e: Env, argv: []const []const u8, label: []const u8) !u8 {
 
 /// Like runTransfer with an explicit child environment (null = inherit aimgr's).
 pub fn runTransferEnv(e: Env, argv: []const []const u8, env: ?*const std.process.Environ.Map, label: []const u8) !u8 {
+    return runTransferWatch(e, argv, env, label, null);
+}
+
+/// Watch a growing download: aimgr prints "aimgr-progress: done=N total=M" lines (about once a
+/// second, only when the value changed) because llama itself prints nothing when not on a terminal.
+pub const Watch = struct {
+    /// <hub cache>/models--owner--repo/blobs
+    dir: []const u8,
+    /// Expected bytes; 0 = unknown.
+    total: u64,
+};
+
+/// Like runTransferEnv, additionally reporting download progress for `watch`.
+pub fn runTransferWatch(e: Env, argv: []const []const u8, env: ?*const std.process.Environ.Map, label: []const u8, watch: ?Watch) !u8 {
     installHandlers();
     defer resetHandlers();
     stop_requested.store(0, .monotonic);
@@ -143,11 +158,26 @@ pub fn runTransferEnv(e: Env, argv: []const []const u8, env: ?*const std.process
     const pid: i32 = @intCast(child.id.?);
     var stop: StopState = .{};
     var tick: u32 = 0;
+    var best: u64 = 0;
+    var printed: u64 = std.math.maxInt(u64);
     while (pidAlive(e.gpa, e.io, pid)) : (tick += 1) {
         try pollStop(e, pid, tick, &stop, label);
+        if (watch) |w| if (tick % 4 == 0) {
+            best = @max(best, dlwatch.bytesInProgress(e.io, w.dir)); // monotonic: blobs are renamed when complete
+            if (w.total > 0) best = @min(best, w.total);
+            if (best != printed) {
+                try e.out.print("aimgr-progress: done={d} total={d}\n", .{ best, w.total });
+                try e.out.flush();
+                printed = best;
+            }
+        };
         e.io.sleep(.fromMilliseconds(250), .awake) catch {};
     }
     const term = child.wait(e.io) catch return 1;
+    if (watch) |w| if (w.total > 0 and term == .exited and term.exited == 0) {
+        try e.out.print("aimgr-progress: done={d} total={d}\n", .{ w.total, w.total });
+        try e.out.flush();
+    };
     const cancelled = stop.term_sent_at != null or stop_requested.load(.monotonic) > 0;
     switch (term) {
         .exited => |c| {

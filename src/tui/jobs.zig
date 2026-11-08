@@ -5,6 +5,7 @@
 const std = @import("std");
 const backend = @import("../backend.zig");
 const netstat = @import("../netstat.zig");
+const progress_mod = @import("../progress.zig");
 
 pub const Kind = enum { pull, update, remove, server, abliterate, setup, search };
 pub const State = enum { running, stopping, done, failed, cancelled };
@@ -28,6 +29,11 @@ pub const Job = struct {
     term_sent_tick: ?u64 = null,
     /// Set once the UI has consumed this job's result (search results).
     handled: bool = false,
+    /// Parsed from the log: ollama pull layers, aimgr-progress lines (llama), or stage markers.
+    progress: ?progress_mod.Progress = null,
+    /// Incremental ollama-pull parser state and how much of the log it has consumed.
+    tracker: progress_mod.PullTracker = .{},
+    log_pos: u64 = 0,
     child: std.process.Child,
 
     pub fn isActive(self: Job) bool {
@@ -47,6 +53,7 @@ pub const Jobs = struct {
             self.gpa.free(j.model);
             self.gpa.free(j.log_path);
             self.gpa.free(j.last_line);
+            j.tracker.deinit(self.gpa);
             for (j.argv) |a| self.gpa.free(a);
             self.gpa.free(j.argv);
         }
@@ -132,12 +139,16 @@ pub const Jobs = struct {
         var finished = false;
         for (self.list.items) |*j| {
             if (!j.isActive()) continue;
-            if (self.tick % 5 == 0) self.refreshTail(j);
+            if (self.tick % 5 == 0) {
+                self.refreshTail(j);
+                self.refreshProgress(j);
+            }
             if (j.kind == .server and !j.listening and self.tick % 5 == 0) {
                 if (j.port) |p| j.listening = netstat.isListening(self.gpa, self.io, p);
             }
             if (alive(self.gpa, self.io, j.pid)) continue;
             self.refreshTail(j);
+            self.refreshProgress(j);
             const term = j.child.wait(self.io) catch {
                 j.state = .failed;
                 finished = true;
@@ -147,6 +158,9 @@ pub const Jobs = struct {
                 .exited => |c| {
                     j.exit_code = c;
                     j.state = if (j.state == .stopping) .cancelled else if (c == 0) .done else .failed;
+                    if (j.state == .done) if (j.progress) |*pr| {
+                        if (pr.total > 0) pr.done = pr.total; // the job finished: show a full bar
+                    };
                 },
                 else => j.state = if (j.state == .stopping) .cancelled else .failed,
             }
@@ -172,6 +186,30 @@ pub const Jobs = struct {
         std.posix.kill(j.pid, .KILL) catch {};
     }
 
+    fn refreshProgress(self: *Jobs, j: *Job) void {
+        if (std.mem.eql(u8, j.log_path, "(no log)")) return;
+        switch (j.kind) {
+            .pull, .update => if (j.backend == .ollama) {
+                var buf: [64 * 1024]u8 = undefined;
+                const n = readFrom(self.io, j.log_path, j.log_pos, &buf) catch return;
+                if (n == 0) return;
+                j.log_pos += n;
+                j.tracker.feed(self.gpa, buf[0..n]) catch return;
+                if (j.tracker.progress()) |pr| j.progress = pr;
+            } else {
+                const text = readTail(self.gpa, self.io, j.log_path) catch return;
+                defer self.gpa.free(text);
+                if (progress_mod.parseAimgrProgress(text)) |pr| j.progress = pr;
+            },
+            .abliterate, .setup => {
+                const text = readTail(self.gpa, self.io, j.log_path) catch return;
+                defer self.gpa.free(text);
+                if (progress_mod.parseStages(text)) |pr| j.progress = pr;
+            },
+            else => {},
+        }
+    }
+
     /// Sanitized last line of the job log (handles \r progress and ANSI escapes).
     fn refreshTail(self: *Jobs, j: *Job) void {
         if (std.mem.eql(u8, j.log_path, "(no log)")) return;
@@ -193,11 +231,20 @@ fn alive(gpa: std.mem.Allocator, io: std.Io, pid: i32) bool {
     return text[rp + 2] != 'Z';
 }
 
+fn readFrom(io: std.Io, path: []const u8, pos: u64, buf: []u8) !usize {
+    var f = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const len = try f.length(io);
+    if (pos >= len) return 0;
+    const want: usize = @intCast(@min(len - pos, buf.len));
+    return f.readPositionalAll(io, buf[0..want], pos);
+}
+
 fn readTail(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     var f = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     const len = try f.length(io);
-    const want: u64 = 4096;
+    const want: u64 = 16384;
     const start = if (len > want) len - want else 0;
     const buf = try gpa.alloc(u8, @intCast(@min(len, want)));
     errdefer gpa.free(buf);
@@ -218,6 +265,12 @@ pub fn lastLine(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
                 i += 2;
                 while (i < text.len and !(text[i] >= 0x40 and text[i] <= 0x7e)) i += 1;
             }
+            continue;
+        }
+        // Block-element glyphs (U+2580-U+259F, e.g. ollama's own "▕███▏" bar) are dropped: the
+        // Transfers tab draws a real bar, and a clipped multi-byte glyph would show as garbage.
+        if (b == 0xE2 and i + 2 < text.len and text[i + 1] == 0x96 and text[i + 2] >= 0x80 and text[i + 2] <= 0x9F) {
+            i += 2;
             continue;
         }
         if (b == '\n' or b == '\r') {
@@ -244,4 +297,10 @@ test "lastLine empty" {
     const l = try lastLine(std.testing.allocator, "\n\n  \n");
     defer std.testing.allocator.free(l);
     try std.testing.expectEqualStrings("", l);
+}
+
+test "lastLine drops block-element bar glyphs" {
+    const l = try lastLine(std.testing.allocator, "pulling abc:  48% \xe2\x96\x95\xe2\x96\x88\xe2\x96\x88   \xe2\x96\x8f 1.2 GB/2.5 GB  30 MB/s\n");
+    defer std.testing.allocator.free(l);
+    try std.testing.expectEqualStrings("pulling abc:  48%     1.2 GB/2.5 GB  30 MB/s", l);
 }
