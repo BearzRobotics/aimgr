@@ -1,6 +1,7 @@
 //! A private llama-server for one agent session: started on a free loopback port, probed for tool
 //! support, and always stopped when the session ends. Bound to 127.0.0.1 only; never public.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const http = @import("../http.zig");
 const netstat = @import("../netstat.zig");
 const supervise = @import("../supervise.zig");
@@ -8,18 +9,18 @@ const launcher = @import("../launcher.zig");
 
 pub const Server = struct {
     child: std.process.Child,
-    pid: i32,
+    pid: platform.Pid,
     port: u16,
     log_path: []const u8,
 
     /// SIGTERM, then wait. llama exits promptly; a hung server is killed after ~15 s (it is aimgr's own helper process).
     pub fn stop(self: *Server, gpa: std.mem.Allocator, io: std.Io) void {
-        std.posix.kill(self.pid, .TERM) catch {};
+        platform.terminate(self.pid);
         var waited: u32 = 0;
         while (supervise.pidAlive(gpa, io, self.pid) and waited < 60) : (waited += 1) {
             io.sleep(.fromMilliseconds(250), .awake) catch {};
         }
-        if (supervise.pidAlive(gpa, io, self.pid)) std.posix.kill(self.pid, .KILL) catch {};
+        if (supervise.pidAlive(gpa, io, self.pid)) platform.killHard(self.pid);
         _ = self.child.wait(io) catch {};
     }
 };
@@ -76,7 +77,7 @@ pub fn start(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: 
         .stdout = sink,
         .stderr = sink,
     }) catch return error.SpawnFailed;
-    const pid: i32 = @intCast(child.id.?);
+    const pid: platform.Pid = child.id.?;
     var srv: Server = .{ .child = child, .pid = pid, .port = port, .log_path = log_path };
 
     const url = std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/health", .{port}) catch return error.OutOfMemory;

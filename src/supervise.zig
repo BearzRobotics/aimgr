@@ -5,32 +5,21 @@ const std = @import("std");
 const launcher = @import("launcher.zig");
 const netstat = @import("netstat.zig");
 const dlwatch = @import("dlwatch.zig");
+const platform = @import("platform.zig");
 
 var stop_requested = std.atomic.Value(u8).init(0);
 
-fn onSignal(_: std.posix.SIG) callconv(.c) void {
+fn onSignal() void {
     _ = stop_requested.fetchAdd(1, .monotonic);
 }
 
 /// Handler (not SIG_IGN) so the disposition resets to default across exec in children.
 fn installHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = onSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(.INT, &act, null);
-    std.posix.sigaction(.TERM, &act, null);
+    platform.onInterrupt(onSignal, false);
 }
 
 fn resetHandlers() void {
-    const act: std.posix.Sigaction = .{
-        .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(.INT, &act, null);
-    std.posix.sigaction(.TERM, &act, null);
+    platform.resetInterrupt();
 }
 
 pub const Env = struct {
@@ -75,14 +64,8 @@ pub fn runChat(e: Env, plan: launcher.Plan) !u8 {
     };
 }
 
-pub fn pidAlive(gpa: std.mem.Allocator, io: std.Io, pid: i32) bool {
-    var buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "/proc/{d}/stat", .{pid}) catch return false;
-    const text = netstat.readProc(gpa, io, path, 4096) catch return false;
-    defer gpa.free(text);
-    const rp = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
-    if (rp + 2 >= text.len) return false;
-    return text[rp + 2] != 'Z';
+pub fn pidAlive(gpa: std.mem.Allocator, io: std.Io, pid: platform.Pid) bool {
+    return platform.alive(gpa, io, pid);
 }
 
 /// Ask a yes/no question on stdin. Anything but "y"/"yes" (or unreadable stdin) is no.
@@ -100,17 +83,17 @@ const StopState = struct { term_sent_at: ?u32 = null };
 
 /// Graceful stop on first signal (SIGTERM); escalate to SIGKILL only with user
 /// approval (second signal, or ~10 s after SIGTERM at 250 ms ticks).
-fn pollStop(e: Env, pid: i32, tick: u32, st: *StopState, label: []const u8) !void {
+fn pollStop(e: Env, pid: platform.Pid, tick: u32, st: *StopState, label: []const u8) !void {
     const stops = stop_requested.load(.monotonic);
     if (stops > 0 and st.term_sent_at == null) {
         try e.out.print("{s}: stopping (SIGTERM)...\n", .{label});
         try e.out.flush();
-        std.posix.kill(pid, .TERM) catch {};
+        platform.terminate(pid);
         st.term_sent_at = tick;
     } else if (st.term_sent_at) |t0| {
         if (stops > 1 or tick - t0 > 40) {
             if (confirm(e, "process has not exited; send SIGKILL?")) {
-                std.posix.kill(pid, .KILL) catch {};
+                platform.killHard(pid);
             } else {
                 st.term_sent_at = tick;
                 stop_requested.store(1, .monotonic);
@@ -155,7 +138,7 @@ pub fn runTransferWatch(e: Env, argv: []const []const u8, env: ?*const std.proce
         try e.err.print("aimgr: cannot start {s}: {s}\n", .{ argv[0], @errorName(err) });
         return 1;
     };
-    const pid: i32 = @intCast(child.id.?);
+    const pid: platform.Pid = child.id.?;
     var stop: StopState = .{};
     var tick: u32 = 0;
     var best: u64 = 0;
@@ -240,8 +223,8 @@ pub fn runServer(e: Env, plan: launcher.Plan, label: []const u8) !u8 {
         try e.err.print("aimgr: cannot start {s}: {s}\n", .{ plan.argv[0], @errorName(err) });
         return 1;
     };
-    const pid: i32 = @intCast(child.id.?);
-    try e.out.print("{s}: started pid {d}; waiting for port {d}...\n  log: {s}\n", .{ label, pid, port, log_path });
+    const pid: platform.Pid = child.id.?;
+    try e.out.print("{s}: started pid {d}; waiting for port {d}...\n  log: {s}\n", .{ label, platform.pidNumber(pid), port, log_path });
     try e.out.flush();
 
     var announced = false;

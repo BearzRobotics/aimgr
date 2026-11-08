@@ -5,6 +5,7 @@
 //! Module-level state is intentional: there is exactly one controlling
 //! terminal, and the Loop/Vaxis structs hold pointers to each other.
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 
 pub const A_BOLD: c_int = 1;
@@ -97,12 +98,18 @@ pub fn suspendTerm() void {
     loop.stop();
     vx.exitAltScreen(tty.writer()) catch {};
     tty.writer().flush() catch {};
-    std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
+    if (builtin.os.tag == .windows) {
+        vaxis.Tty.setConsoleMode(tty.stdin, tty.initial_input_mode) catch {};
+        vaxis.Tty.setConsoleMode(tty.stdout, tty.initial_output_mode) catch {};
+    } else std.posix.tcsetattr(tty.fd.handle, .FLUSH, tty.termios) catch {};
 }
 
 pub fn resumeTerm() void {
     if (!active) return;
-    _ = vaxis.Tty.makeRaw(tty.fd.handle) catch {};
+    if (builtin.os.tag == .windows) {
+        vaxis.Tty.setConsoleMode(tty.stdin, vaxis.Tty.input_raw_mode) catch {};
+        vaxis.Tty.setConsoleMode(tty.stdout, vaxis.Tty.output_raw_mode) catch {};
+    } else _ = vaxis.Tty.makeRaw(tty.fd.handle) catch {};
     loop.start() catch {};
     vx.enterAltScreen(tty.writer()) catch {};
     vx.queueRefresh();

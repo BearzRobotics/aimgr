@@ -7,6 +7,7 @@ const inventory = @import("inventory.zig");
 const modelinfo = @import("modelinfo.zig");
 const schedule = @import("schedule.zig");
 const sources_io = @import("sources_io.zig");
+const platform = @import("platform.zig");
 const supervise = @import("supervise.zig");
 const agent_cmd = @import("agent_cmd.zig");
 const policy = @import("agent/policy.zig");
@@ -203,13 +204,13 @@ fn acquireLock(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env
     while (tries < 2) : (tries += 1) {
         if (std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true })) |f| {
             defer f.close(io);
-            const pid = std.fmt.allocPrint(arena, "{d}\n", .{std.os.linux.getpid()}) catch "0\n";
+            const pid = std.fmt.allocPrint(arena, "{d}\n", .{platform.selfPid()}) catch "0\n";
             f.writeStreamingAll(io, pid) catch {};
             return true;
         } else |_| {}
         const txt = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(32)) catch "";
-        const pid = std.fmt.parseInt(i32, std.mem.trim(u8, txt, " \n"), 10) catch 0;
-        if (pid > 0 and supervise.pidAlive(gpa, io, pid)) {
+        const pid = std.fmt.parseInt(u32, std.mem.trim(u8, txt, " \n"), 10) catch 0;
+        if (pid > 0 and platform.aliveNumber(gpa, io, pid)) {
             try out.print("schedule: another run is active (pid {d}); skipping\n", .{pid});
             return false;
         }

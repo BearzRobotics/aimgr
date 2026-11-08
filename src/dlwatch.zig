@@ -8,10 +8,10 @@ const http = @import("http.zig");
 
 /// $HF_HUB_CACHE, else $HF_HOME/hub, else $XDG_CACHE_HOME/huggingface/hub, else ~/.cache/huggingface/hub.
 pub fn hubCacheDir(arena: std.mem.Allocator, env: *const std.process.Environ.Map) !?[]const u8 {
-    if (env.get("HF_HUB_CACHE")) |d| if (d.len > 0 and d[0] == '/') return d;
-    if (env.get("HF_HOME")) |d| if (d.len > 0 and d[0] == '/') return try std.fs.path.join(arena, &.{ d, "hub" });
-    if (env.get("XDG_CACHE_HOME")) |d| if (d.len > 0 and d[0] == '/') return try std.fs.path.join(arena, &.{ d, "huggingface", "hub" });
-    if (env.get("HOME")) |h| if (h.len > 0) return try std.fs.path.join(arena, &.{ h, ".cache", "huggingface", "hub" });
+    if (env.get("HF_HUB_CACHE")) |d| if (d.len > 0 and std.fs.path.isAbsolute(d)) return d;
+    if (env.get("HF_HOME")) |d| if (d.len > 0 and std.fs.path.isAbsolute(d)) return try std.fs.path.join(arena, &.{ d, "hub" });
+    if (env.get("XDG_CACHE_HOME")) |d| if (d.len > 0 and std.fs.path.isAbsolute(d)) return try std.fs.path.join(arena, &.{ d, "huggingface", "hub" });
+    if (@import("config.zig").homeDir(env)) |h| return try std.fs.path.join(arena, &.{ h, ".cache", "huggingface", "hub" });
     return null;
 }
 

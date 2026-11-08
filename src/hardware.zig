@@ -6,6 +6,62 @@
 const std = @import("std");
 const netstat = @import("netstat.zig");
 const process = @import("process.zig");
+const builtin = @import("builtin");
+
+const MEMORYSTATUSEX = extern struct {
+    length: u32 = @sizeOf(MEMORYSTATUSEX),
+    load: u32 = 0,
+    total_phys: u64 = 0,
+    avail_phys: u64 = 0,
+    total_page: u64 = 0,
+    avail_page: u64 = 0,
+    total_virtual: u64 = 0,
+    avail_virtual: u64 = 0,
+    avail_ext: u64 = 0,
+};
+extern "kernel32" fn GlobalMemoryStatusEx(*MEMORYSTATUSEX) callconv(.winapi) c_int;
+
+fn containsFold(h: []const u8, n: []const u8) bool {
+    if (n.len > h.len) return false;
+    var i: usize = 0;
+    while (i + n.len <= h.len) : (i += 1) if (std.ascii.eqlIgnoreCase(h[i .. i + n.len], n)) return true;
+    return false;
+}
+
+/// "Name|bytes" lines (as printed by the PowerShell query in detectWindows) -> GPUs.
+pub fn parseWindowsGpus(arena: std.mem.Allocator, text: []const u8, gpus: *std.ArrayList(Gpu)) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |l| {
+        const t = std.mem.trim(u8, l, " \r\t");
+        const bar = std.mem.lastIndexOfScalar(u8, t, '|') orelse continue;
+        const name = std.mem.trim(u8, t[0..bar], " ");
+        const bytes = std.fmt.parseInt(u64, std.mem.trim(u8, t[bar + 1 ..], " "), 10) catch continue;
+        if (name.len == 0 or bytes == 0) continue;
+        if (containsFold(name, "basic")) continue; // Microsoft Basic Display Adapter
+        const vendor: Vendor = if (containsFold(name, "nvidia")) .nvidia else if (containsFold(name, "amd") or containsFold(name, "radeon")) .amd else if (containsFold(name, "intel")) .intel else .other;
+        try gpus.append(arena, .{ .vendor = vendor, .label = try arena.dupe(u8, name), .vram_total = bytes, .integrated = bytes < (1 << 30), .source = "windows registry" });
+    }
+}
+
+fn detectWindows(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io) !Info {
+    var info: Info = .{ .mem = .{}, .gpus = &.{} };
+    var ms: MEMORYSTATUSEX = .{};
+    if (GlobalMemoryStatusEx(&ms) != 0) info.mem = .{ .total = ms.total_phys, .available = ms.avail_phys };
+    var gpus: std.ArrayList(Gpu) = .empty;
+    const nv = process.run(gpa, io, &.{ "nvidia-smi", "--query-gpu=name,memory.total,memory.used", "--format=csv,noheader,nounits" }, 10);
+    defer nv.deinit(gpa);
+    if (nv.ok()) try parseNvidiaSmi(arena, nv.stdout, &gpus);
+    if (gpus.items.len == 0) {
+        const ps =
+            "Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11cd-bfc1-08002be10318}\\0*' -ErrorAction SilentlyContinue | " ++
+            "ForEach-Object { $_.DriverDesc + '|' + $_.'HardwareInformation.qwMemorySize' }";
+        const r = process.run(gpa, io, &.{ "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps }, 15);
+        defer r.deinit(gpa);
+        if (r.ok()) try parseWindowsGpus(arena, r.stdout, &gpus);
+    }
+    info.gpus = try gpus.toOwnedSlice(arena);
+    return info;
+}
 
 pub const Memory = struct { total: u64 = 0, available: u64 = 0 };
 
@@ -91,6 +147,7 @@ fn readU64(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?u64 {
 }
 
 pub fn detect(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io) !Info {
+    if (builtin.os.tag == .windows) return detectWindows(arena, gpa, io);
     var info: Info = .{ .mem = .{}, .gpus = &.{} };
     if (netstat.readProc(gpa, io, "/proc/meminfo", 1 << 16)) |t| {
         defer gpa.free(t);
@@ -258,6 +315,16 @@ pub fn estimateWith(id: []const u8, quant: ?[]const u8, reported_bytes: ?u64, pa
 
 pub fn gb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1e9;
+}
+
+test "windows gpu lines" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var g: std.ArrayList(Gpu) = .empty;
+    try parseWindowsGpus(a.allocator(), "AMD Radeon RX 7800 XT|17163091968\r\nMicrosoft Basic Display Adapter|1\r\nIntel(R) UHD Graphics|134217728\r\n", &g);
+    try std.testing.expectEqual(@as(usize, 2), g.items.len);
+    try std.testing.expect(g.items[0].vendor == .amd);
+    try std.testing.expect(g.items[1].integrated);
 }
 
 test "meminfo" {

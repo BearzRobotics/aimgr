@@ -208,11 +208,10 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     // Directories: canonical real paths that exist and are directories.
     var dirs: std.ArrayList([]const u8) = .empty;
     const wanted: []const []const u8 = if (dirs_cli.items.len > 0) dirs_cli.items else eff.s.dirs;
-    if (wanted.len == 0) {
-        try err.writeAll("aimgr: no directory given. Use --dir PATH (the model can only look inside it), or store one with: aimgr agent set <backend> <model> dirs=/path\n");
-        return 2;
-    }
-    for (wanted) |d| {
+    // No directory given: the current one, like launching an editor agent in a project folder.
+    const cwd_list: []const []const u8 = &.{"."};
+    const from_cwd = wanted.len == 0;
+    for (if (from_cwd) cwd_list else wanted) |d| {
         const real = std.Io.Dir.cwd().realPathFileAlloc(io, d, arena) catch {
             try err.print("aimgr: directory not found: {s}\n", .{d});
             return 1;
@@ -229,6 +228,11 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         try dirs.append(arena, try arena.dupe(u8, real));
     }
     eff.s.dirs = dirs.items;
+    // Folders the user already chose (stored for this model, or trusted before) need no question; a new one
+    // is asked once on a terminal and remembered. An explicit --dir/stored dir from a script is consent enough.
+    if (from_cwd or dirs_cli.items.len > 0) {
+        if (!try trustDirs(arena, io, env, out, err, dirs.items)) return 1;
+    }
 
     return launch(arena, gpa, io, env, out, err, kind, id, eff.s, .interactive);
 }
@@ -329,4 +333,58 @@ fn loadMcp(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *c
         err.print("aimgr: {s} is invalid; MCP servers are not loaded\n", .{path}) catch {};
         return &.{};
     };
+}
+
+/// Directories the user has said "yes, trust this" to, one absolute path per line.
+fn trustFile(arena: std.mem.Allocator, env: *const std.process.Environ.Map) ?[]const u8 {
+    return (config.configPath(arena, env, "trusted-dirs") catch return null);
+}
+
+fn isTrusted(list: []const u8, dir: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, '\n');
+    while (it.next()) |l| {
+        const t = std.mem.trim(u8, l, " \r");
+        if (t.len == 0) continue;
+        if (std.mem.eql(u8, t, dir)) return true;
+        if (dir.len > t.len and std.mem.startsWith(u8, dir, t) and (t[t.len - 1] == '/' or dir[t.len] == '/')) return true;
+    }
+    return false;
+}
+
+/// Ask once per new directory (only on a terminal) and remember the answer. Returns false if the user declined.
+fn trustDirs(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, out: *std.Io.Writer, err: *std.Io.Writer, dirs: []const []const u8) !bool {
+    const path = trustFile(arena, env);
+    const old = if (path) |p| std.Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(64 * 1024)) catch "" else "";
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(arena, old);
+    var changed = false;
+    for (dirs) |d| {
+        if (isTrusted(old, d)) continue;
+        if (!(std.Io.File.stdin().isTty(io) catch false)) continue;
+        try out.print("\nDo you trust this folder?\n  {s}\nThe model will be able to read files here (and, at level 'ask', change them, each change shown and approved by you).\nTrust it and remember? [y/N] ", .{d});
+        try out.flush();
+        var buf: [64]u8 = undefined;
+        var r = std.Io.File.stdin().reader(io, &buf);
+        const line = (r.interface.takeDelimiter('\n') catch null) orelse "";
+        const l = std.mem.trim(u8, line, " \r\t");
+        if (!(std.ascii.eqlIgnoreCase(l, "y") or std.ascii.eqlIgnoreCase(l, "yes"))) {
+            try err.writeAll("aimgr: not trusted; nothing was started\n");
+            return false;
+        }
+        try text.appendSlice(arena, d);
+        try text.append(arena, '\n');
+        changed = true;
+    }
+    if (changed) if (path) |p| {
+        if (std.fs.path.dirname(p)) |dd| std.Io.Dir.cwd().createDirPath(io, dd) catch {};
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = text.items }) catch {};
+    };
+    return true;
+}
+
+test "trusted dir matching" {
+    try std.testing.expect(isTrusted("/stuff\n", "/stuff"));
+    try std.testing.expect(isTrusted("/stuff\n", "/stuff/git/x"));
+    try std.testing.expect(!isTrusted("/stuff\n", "/stuffy"));
+    try std.testing.expect(!isTrusted("", "/a"));
 }

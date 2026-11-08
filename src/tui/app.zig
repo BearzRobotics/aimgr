@@ -1,6 +1,7 @@
 //! TUI event loop and actions. Every state-changing action goes through a
 //! confirmation modal and the same argv builders as the CLI.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const term = @import("term.zig");
 const model = @import("model.zig");
 const jobs_mod = @import("jobs.zig");
@@ -30,15 +31,12 @@ const App = State.App;
 // Signal handlers cannot take context: one atomic flag (documented exception).
 var signalled = std.atomic.Value(bool).init(false);
 
-fn onSignal(_: std.posix.SIG) callconv(.c) void {
+fn onSignal() void {
     signalled.store(true, .monotonic);
 }
 
 fn installSignals() void {
-    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onSignal }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(.INT, &act, null);
-    std.posix.sigaction(.TERM, &act, null);
-    std.posix.sigaction(.HUP, &act, null);
+    platform.onInterrupt(onSignal, true);
 }
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map) !u8 {
@@ -156,7 +154,7 @@ fn stopAll(app: *App) bool {
 fn reportLeftovers(app: *App, io: std.Io) void {
     _ = io;
     for (app.jobs.list.items) |j| if (j.isActive()) {
-        std.debug.print("aimgr: job #{d} ({s} {s}) is still running as pid {d}\n", .{ j.id, @tagName(j.kind), j.model, j.pid });
+        std.debug.print("aimgr: job #{d} ({s} {s}) is still running as pid {d}\n", .{ j.id, @tagName(j.kind), j.model, platform.pidNumber(j.pid) });
     };
 }
 
@@ -672,7 +670,7 @@ fn beginAgent(app: *App) void {
     if (agent_settings.find(entries, row.model.backend, row.model.id)) |i| if (entries[i].dirs != null) return runAgent(app, row.model.backend, row.model.id, null);
     app.prompt_is_agent = true;
     app.prompt_is_search = false;
-    app.prompt = "Directory the model may look at (absolute path; it cannot leave it):";
+    app.prompt = "Folder for the model (Enter = current folder; asks once to trust it):";
     app.prompt_buf.clearRetainingCapacity();
 }
 
@@ -680,9 +678,10 @@ fn submitAgent(app: *App) void {
     app.prompt = null;
     app.prompt_is_agent = false;
     const dir = std.mem.trim(u8, app.prompt_buf.items, " ");
-    if (dir.len == 0) return app.setMessage(false, "agent cancelled (no directory entered)", .{});
-    if (dir[0] != '/') return app.setMessage(true, "the directory must be an absolute path", .{});
     const row = app.currentRow() orelse return;
+    // Empty = the folder aimgr was started in (the agent asks once whether to trust it).
+    if (dir.len == 0) return runAgent(app, row.model.backend, row.model.id, null);
+    if (!std.fs.path.isAbsolute(dir)) return app.setMessage(true, "the directory must be an absolute path (or leave it empty for the current folder)", .{});
     runAgent(app, row.model.backend, row.model.id, dir);
 }
 
@@ -701,8 +700,14 @@ fn runAgent(app: *App, be: backend.Kind, id: []const u8, dir: ?[]const u8) void 
     var ew: std.Io.File.Writer = .initStreaming(.stderr(), app.io, &eb);
     const env: supervise.Env = .{ .gpa = app.gpa, .io = app.io, .environ = app.environ, .out = &ow.interface, .err = &ew.interface, .log_dir = null };
     const code = supervise.runChat(env, .{ .argv = argv.items }) catch 1;
+    if (code != 0) ow.interface.writeAll("\n(the agent did not run; press Enter to return)\n") catch {};
     ow.interface.flush() catch {};
     ew.interface.flush() catch {};
+    if (code != 0) {
+        var b: [16]u8 = undefined;
+        var r = std.Io.File.stdin().reader(app.io, &b);
+        _ = r.interface.takeDelimiter('\n') catch {};
+    }
     term.resumeTerm();
     installSignals();
     if (code == 0) app.setMessage(false, "agent session ended", .{}) else app.setMessage(true, "agent exited with code {d} (see the messages above in your terminal history)", .{code});

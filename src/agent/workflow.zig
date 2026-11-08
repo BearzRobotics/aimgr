@@ -2,6 +2,7 @@
 //! enter_worktree / exit_worktree. Every start or removal is approved by the user; everything a session
 //! starts is stopped when the session ends (and, via the kernel, if aimgr itself is killed).
 const std = @import("std");
+const platform = @import("../platform.zig");
 const policy = @import("policy.zig");
 const tools = @import("tools.zig");
 const envm = @import("env.zig");
@@ -83,7 +84,7 @@ fn runBackground(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Setting
     }) catch return calls.denied(arena, "could not start the task");
     try st.bg.append(e.gpa, .{
         .id = id,
-        .pid = @intCast(child.id.?),
+        .pid = child.id.?,
         .log_path = log_path,
         .command = try e.gpa.dupe(u8, command[0..@min(command.len, 200)]),
         .child = child,
@@ -137,10 +138,10 @@ fn checkBackground(e: Env, st: *State, arena: std.mem.Allocator, args: std.json.
 fn killTask(e: Env, b: *envm.Bg) void {
     if (b.reaped) return;
     if (supervise.pidAlive(e.gpa, e.io, b.pid)) {
-        std.posix.kill(b.pid, .TERM) catch {};
+        platform.terminate(b.pid);
         var waited: u32 = 0;
         while (supervise.pidAlive(e.gpa, e.io, b.pid) and waited < 12) : (waited += 1) e.io.sleep(.fromMilliseconds(250), .awake) catch {};
-        if (supervise.pidAlive(e.gpa, e.io, b.pid)) std.posix.kill(b.pid, .KILL) catch {};
+        if (supervise.pidAlive(e.gpa, e.io, b.pid)) platform.killHard(b.pid);
     }
     reap(e, b);
 }

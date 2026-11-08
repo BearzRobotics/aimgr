@@ -3,6 +3,7 @@
 //! not the job) whose stdout/stderr go to a log file. The UI polls: no threads,
 //! so it stays responsive during long downloads.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const backend = @import("../backend.zig");
 const netstat = @import("../netstat.zig");
 const progress_mod = @import("../progress.zig");
@@ -18,7 +19,7 @@ pub const Job = struct {
     model: []const u8,
     argv: []const []const u8,
     log_path: []const u8,
-    pid: i32,
+    pid: platform.Pid,
     state: State = .running,
     exit_code: ?u8 = null,
     /// Server jobs: port to watch, and whether it was observed listening.
@@ -99,7 +100,7 @@ pub const Jobs = struct {
             .stdin = .ignore,
             .stdout = sink,
             .stderr = sink,
-            .pgid = 0, // own process group: terminal Ctrl-C must not hit jobs directly
+            .pgid = if (platform.is_windows) null else 0, // own process group: terminal Ctrl-C must not hit jobs directly
         }) catch |err| return switch (err) {
             error.FileNotFound => "executable not found",
             else => "could not start process",
@@ -124,7 +125,7 @@ pub const Jobs = struct {
             .model = model_copy,
             .argv = copy,
             .log_path = log_path,
-            .pid = @intCast(child.id.?),
+            .pid = child.id.?,
             .port = port,
             .last_line = try self.gpa.dupe(u8, ""),
             .child = child,
@@ -174,7 +175,7 @@ pub const Jobs = struct {
     pub fn stop(self: *Jobs, j: *Job) bool {
         if (!j.isActive()) return false;
         if (j.state == .running) {
-            std.posix.kill(j.pid, .TERM) catch {};
+            platform.terminate(j.pid);
             j.state = .stopping;
             j.term_sent_tick = self.tick;
             return false;
@@ -183,7 +184,7 @@ pub const Jobs = struct {
     }
 
     pub fn kill(_: *Jobs, j: *Job) void {
-        std.posix.kill(j.pid, .KILL) catch {};
+        platform.killHard(j.pid);
     }
 
     fn refreshProgress(self: *Jobs, j: *Job) void {
@@ -221,14 +222,8 @@ pub const Jobs = struct {
     }
 };
 
-fn alive(gpa: std.mem.Allocator, io: std.Io, pid: i32) bool {
-    var buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, "/proc/{d}/stat", .{pid}) catch return false;
-    const text = netstat.readProc(gpa, io, path, 4096) catch return false;
-    defer gpa.free(text);
-    const rp = std.mem.lastIndexOfScalar(u8, text, ')') orelse return false;
-    if (rp + 2 >= text.len) return false;
-    return text[rp + 2] != 'Z';
+fn alive(gpa: std.mem.Allocator, io: std.Io, pid: platform.Pid) bool {
+    return platform.alive(gpa, io, pid);
 }
 
 fn readFrom(io: std.Io, path: []const u8, pos: u64, buf: []u8) !usize {

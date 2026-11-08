@@ -1,5 +1,6 @@
 //! Shared types for agent sessions: the single stdin reader, the environment, session state and the audit log.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const chat = @import("chat.zig");
 const mcp = @import("../mcp.zig");
 const process = std.process;
@@ -94,7 +95,7 @@ pub const Audit = struct {
 /// A background task started by run_background (owned by the session; stopped when it ends).
 pub const Bg = struct {
     id: u32,
-    pid: i32,
+    pid: platform.Pid,
     log_path: []const u8,
     command: []const u8,
     child: process.Child,
