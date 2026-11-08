@@ -11,6 +11,14 @@ outside the trusted folder by saying so. aimgr also had to work for non-technica
 - **One interface for chat and agent.** `aimgr chat` now runs the agent session at level `off` (no tools at all,
   different system prompt); `aimgr chat --raw` (or `--ctx` / `--gpu-layers`) keeps the backend's own CLI. The TUI's
   `c` and `g` both run aimgr itself in the terminal.
+- **Full-screen session (supersedes the line-oriented box below).** On a terminal, sessions run in a libvaxis
+  full-screen interface: transcript pane with its own scrollback (PgUp/PgDn, wheel), input box with line editing
+  and history pinned at the bottom, live status (spinner, activity, seconds, files searched), approvals as a menu
+  (arrows, numbers, y/a/n, Esc, mouse). The conversation runs on a worker thread that writes to the transcript (ANSI
+  colours from the Markdown renderer become styles) and blocks on the UI for lines and menu answers; `!command`
+  hands the real terminal over and back. The line-oriented session stays for pipes and NO_COLOR. Reason: a
+  line-based screen cannot keep the box, scrollback and the user's keystrokes in order (typed text echoed into the
+  output while the model worked).
 - **Input between two rules.** On a colour terminal the prompt is a line between two full-width rules with a status
   line (model, level, mode) under them; after Enter the message is redrawn as a shaded `❯` block; replies start with
   `●`, are Markdown rendered with md-zig (vendored, BearzRobotics/md-zig v0.3.0) and indented under the bullet.

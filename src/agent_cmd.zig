@@ -280,7 +280,7 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
     }
     if (s.level != .off) try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
-    if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena);
+    if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena, env);
 
     // llama: start a private server for this session, verify tool support, always stop it afterwards.
     const log_dir = try config.statePath(arena, env, "logs");
@@ -303,12 +303,16 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
     }
     renv.api = .openai;
     renv.host_port = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{srv.port});
-    return finish(renv, id, s, sandbox_on, mode, arena);
+    return finish(renv, id, s, sandbox_on, mode, arena, env);
 }
 
-fn finish(renv: run.Env, id: []const u8, s: policy.Settings, sandbox_on: bool, mode: Mode, arena: std.mem.Allocator) !u8 {
+fn finish(renv: run.Env, id: []const u8, s: policy.Settings, sandbox_on: bool, mode: Mode, arena: std.mem.Allocator, env: *const std.process.Environ.Map) !u8 {
     switch (mode) {
-        .interactive => return run.session(renv, id, s, sandbox_on),
+        .interactive => {
+            // On a colour terminal: the full-screen interface, the conversation on a worker thread.
+            if (renv.color) if (fullScreen(renv, id, s, sandbox_on, env)) |code| return code;
+            return run.session(renv, id, s, sandbox_on);
+        },
         .once => |o| {
             const text = (try run.runOnce(renv, id, s, sandbox_on, o.task, arena)) orelse {
                 try o.transcript.writeAll("\nRESULT: the model server could not be reached or failed.\n");
@@ -424,4 +428,51 @@ pub fn chatMain(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, en
     };
     const s: policy.Settings = .{ .level = .off, .subagents = false, .max_steps = 1, .sandbox = .none };
     return launch(arena, gpa, io, env, out, err, kind, id, s, .interactive);
+}
+
+const Worker = struct {
+    e: run.Env,
+    id: []const u8,
+    s: policy.Settings,
+    sandbox_on: bool,
+    ui: *ui_mod.Ui,
+    code: u8 = 1,
+
+    fn main(w: *Worker) void {
+        w.code = run.session(w.e, w.id, w.s, w.sandbox_on) catch |er| blk: {
+            w.e.out.print("\naimgr: the session stopped: {s}\n", .{@errorName(er)}) catch {};
+            break :blk 1;
+        };
+        w.e.out.flush() catch {};
+        w.ui.worker_done.store(true, .release);
+    }
+};
+
+const ui_mod = @import("agent/ui.zig");
+
+/// Run the session in the full-screen interface. Null if the terminal could not be set up (the caller then
+/// falls back to the line-oriented session).
+fn fullScreen(renv_in: run.Env, id: []const u8, s: policy.Settings, sandbox_on: bool, env: *const std.process.Environ.Map) ?u8 {
+    var u: ui_mod.Ui = undefined;
+    u.init(renv_in.gpa, renv_in.io, env) catch return null;
+    @import("agent/activity.zig").useIo(renv_in.io);
+    var renv = renv_in;
+    renv.ui = &u;
+    renv.out = u.writer();
+    renv.err = u.writer();
+    renv.input.ui = &u;
+    var w: Worker = .{ .e = renv, .id = id, .s = s, .sandbox_on = sandbox_on, .ui = &u };
+    const t = std.Thread.spawn(.{}, Worker.main, .{&w}) catch {
+        u.deinit();
+        return null;
+    };
+    const clean = u.run();
+    u.deinit();
+    if (!clean) {
+        // Ctrl-C while the model or a tool was busy: the worker cannot be interrupted, so leave now.
+        // (A private llama server dies with aimgr; background tasks are sandboxed with --die-with-parent.)
+        std.process.exit(130);
+    }
+    t.join();
+    return w.code;
 }

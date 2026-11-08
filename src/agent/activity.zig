@@ -49,13 +49,30 @@ pub fn stop() void {
 
 /// The session is about to block on `what` (it has flushed its output). No-op without a ticker.
 pub fn set(what: []const u8) void {
-    if (thread == null) return;
     acquire();
     defer release();
     label_len = @min(what.len, label_buf.len);
     @memcpy(label_buf[0..label_len], what[0..label_len]);
     started_ms = nowMs(io_global);
     files.store(0, .monotonic);
+}
+
+/// The current activity as "label 12s · 340 files", formatted into `buf`; null when idle.
+pub fn current(buf: []u8) ?[]const u8 {
+    acquire();
+    defer release();
+    if (label_len == 0) return null;
+    const secs = @divTrunc(nowMs(io_global) - started_ms, 1000);
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{s} {d}s", .{ label_buf[0..label_len], secs }) catch {};
+    const n = files.load(.monotonic);
+    if (n > 0) w.print(" · {d} files", .{n}) catch {};
+    return w.buffered();
+}
+
+/// Needed before `set` when no ticker is started (the full-screen UI reads `current` itself).
+pub fn useIo(io: std.Io) void {
+    io_global = io;
 }
 
 /// The session will print again: stop drawing (waits for a tick in progress).

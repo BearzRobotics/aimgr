@@ -3,6 +3,7 @@ const std = @import("std");
 const platform = @import("../platform.zig");
 const chat = @import("chat.zig");
 const mcp = @import("../mcp.zig");
+pub const ui = @import("ui.zig");
 const process = std.process;
 
 /// One stdin reader shared by the prompt and all approvals (two buffered readers would lose input).
@@ -11,6 +12,8 @@ pub const Input = struct {
     buf: [4096]u8 = undefined,
     /// Unattended runs: there is no one to type, every read ends the input.
     closed: bool = false,
+    /// Full-screen session: lines come from the input box.
+    ui: ?*ui.Ui = null,
 
     pub fn init(self: *Input, io: std.Io) void {
         self.reader = std.Io.File.stdin().reader(io, &self.buf);
@@ -19,6 +22,7 @@ pub const Input = struct {
     /// Next line without the newline; null at end of input.
     pub fn line(self: *Input) ?[]const u8 {
         if (self.closed) return null;
+        if (self.ui) |u| return u.nextLine(&self.buf);
         const l = self.reader.interface.takeDelimiter('\n') catch return null;
         return std.mem.trim(u8, l orelse return null, "\r");
     }
@@ -46,6 +50,8 @@ pub const Env = struct {
     state_dir: ?[]const u8 = null,
     /// MCP servers from mcp.toml (user-chosen programs; tools need approval unless listed read-only).
     mcp: []const mcp.Server = &.{},
+    /// Full-screen session interface (null: line-oriented output).
+    ui: ?*ui.Ui = null,
     /// Render the model's replies as formatted Markdown (stdout is a terminal), with ANSI color, at this width.
     markdown: bool = false,
     color: bool = false,

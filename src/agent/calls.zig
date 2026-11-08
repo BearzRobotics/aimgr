@@ -85,10 +85,23 @@ pub fn ask(e: Env, st: *State, question: []const u8) bool {
         e.out.print("  (approved: you said 'always' for {s} this session)\n", .{k}) catch {};
         return true;
     };
-    const choices: []const u8 = if (!st.ask_always) "[y/N]" else if (st.ask_edit) "[y/N/a=allow all edits this session]" else "[y/N/a=always this session]";
-    e.out.print("\n  ? {s}{s}{s}{s}  {s} ", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question, choices }) catch return false;
-    e.out.flush() catch return false;
-    const l = e.input.line() orelse return false;
+    var l: []const u8 = "";
+    if (e.ui) |u| {
+        // A menu: arrows, numbers, y/n or the mouse. The last option is always No.
+        var full_buf: [600]u8 = undefined;
+        const full = std.fmt.bufPrint(&full_buf, "{s}{s}{s}{s}", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question }) catch question;
+        const always_label: []const u8 = if (st.ask_edit) "Yes, and allow all edits in these folders for this session" else "Yes, and don't ask again for this exact action this session";
+        const with_always = [_][]const u8{ "Yes", always_label, "No" };
+        const plain = [_][]const u8{ "Yes", "No" };
+        const opts: []const []const u8 = if (st.ask_always) &with_always else &plain;
+        const pick = u.choose(full, opts) orelse return false;
+        l = if (pick == 0) "y" else if (st.ask_always and pick == 1) "a" else "n";
+    } else {
+        const choices: []const u8 = if (!st.ask_always) "[y/N]" else if (st.ask_edit) "[y/N/a=allow all edits this session]" else "[y/N/a=always this session]";
+        e.out.print("\n  ? {s}{s}{s}{s}  {s} ", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question, choices }) catch return false;
+        e.out.flush() catch return false;
+        l = e.input.line() orelse return false;
+    }
     if (st.ask_always and (std.ascii.eqlIgnoreCase(l, "a") or std.ascii.eqlIgnoreCase(l, "always"))) {
         if (st.ask_edit) {
             st.auto_edits = true;

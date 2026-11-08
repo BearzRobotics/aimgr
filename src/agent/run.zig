@@ -200,7 +200,7 @@ fn printReply(e: Env, ta: std.mem.Allocator, indent: []const u8, text: []const u
         if (md.Document.parse(e.gpa, text, .{ .extensions = md.Extensions.gfm })) |doc_c| {
             var doc = doc_c;
             defer doc.deinit();
-            const cols: usize = @import("../platform.zig").termWidth() orelse e.width;
+            const cols: usize = if (e.ui) |u| u.width() else (@import("../platform.zig").termWidth() orelse e.width);
             if (doc.toTextAlloc(e.gpa, .{ .width = @max(20, cols -| 3), .color = e.color, .unicode = true })) |rendered| {
                 defer e.gpa.free(rendered);
                 // Continuation lines are indented under the bullet, like Claude Code.
@@ -235,6 +235,8 @@ fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(
         else => try tools.shellArgv(a, sh, shell_path, command),
     };
     try e.out.flush();
+    if (e.ui) |u| u.suspendTerm();
+    defer if (e.ui) |u| u.resumeTerm();
     var child = std.process.spawn(e.io, .{
         .argv = argv,
         .cwd = if (s.dirs.len > 0) .{ .path = s.dirs[0] } else .inherit,
@@ -250,7 +252,17 @@ fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(
         .exited => |c| c,
         else => -1,
     } else -1;
-    try e.out.print("[exit code {d}]\n", .{code});
+    if (e.ui != null) {
+        // Still on the normal screen: let the user read the output before the session screen comes back.
+        var ob: [256]u8 = undefined;
+        var fw: std.Io.File.Writer = .initStreaming(.stdout(), e.io, &ob);
+        fw.interface.print("\n[exit code {d}] press Enter to return to aimgr ", .{code}) catch {};
+        fw.interface.flush() catch {};
+        var ib: [256]u8 = undefined;
+        var fr = std.Io.File.stdin().reader(e.io, &ib);
+        _ = fr.interface.takeDelimiter('\n') catch {};
+    }
+    try e.out.print("  $ {s}\n  [exit code {d}]\n", .{ command, code });
     try msgs.append(ha, .{ .role = .user, .content = try std.fmt.allocPrint(ha, "(I ran this command myself in my terminal: `{s}`; it exited with code {d}. Its output was shown to me, not to you.)", .{ command, code }) });
     try msgs.append(ha, .{ .role = .assistant, .content = "Noted." });
 }
@@ -267,7 +279,7 @@ const Screen = struct {
     const box_rows = 4;
 
     fn begin(self: *Screen, e: Env) !void {
-        if (!e.color) return;
+        if (!e.color or e.ui != null) return;
         const sz = platform.termSize() orelse return;
         if (sz.rows < 12 or sz.cols < 30) return;
         self.* = .{ .on = true, .rows = sz.rows, .cols = sz.cols };
@@ -315,6 +327,10 @@ fn statusText(a: std.mem.Allocator, model: []const u8, s: policy.Settings, st: *
 /// added above as a shaded block and the box stays (showing that the model is working). Without a colour
 /// terminal (pipes, NO_COLOR, old consoles) it is a plain "you>" line.
 fn readPrompt(e: Env, scr: *Screen, ta: std.mem.Allocator, model: []const u8, s: policy.Settings, st: *const State) !?[]const u8 {
+    if (e.ui) |u| {
+        u.setStatus(try statusText(ta, model, s, st, ""));
+        return e.input.line();
+    }
     if (!scr.on) {
         try e.out.print("\n[{s} · {s} · {s}]\nyou> ", .{ model, s.level.text(), modeText(st) });
         try e.out.flush();

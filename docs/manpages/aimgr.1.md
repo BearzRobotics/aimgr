@@ -71,7 +71,7 @@ AGENT MODE
 
 Levels. Each model has a level: `off` (chat only), `read-only` (file tools), `inspect` (plus read-only commands), `ask` (plus changes and other commands, each approved by you). Defaults follow the model: no tools -> off; under 7B -> read-only; 7B-30B -> inspect; 30B and up -> ask. Change them in the TUI Settings tab (on a model row: Enter = level, x = sandbox auto/bwrap/none, h = shell, w = web) or with `aimgr agent set ollama MODEL level=ask dirs=/a,/b steps=20 timeout=20 output_kb=64 allow=cmd sandbox=auto root=false shell=bash web=false subagents=true plan=false search_url=https://host/?q={q}`. `aimgr agent show` prints the effective values.
 
-The session. Your input sits between two rules with a status line (model, level, mode) under it, pinned to the bottom four rows of the terminal like Claude Code's input box: everything else (your messages, replies, tool lines, approval questions) scrolls in the area above it, and the box stays while the model works (its status line then says so). After you press Enter your message appears above as a shaded block marked with ❯ and the model's replies start with ● and are rendered as Markdown (md-zig), so the two are easy to tell apart. Without a colour terminal (pipes, NO_COLOR, old Windows consoles), or in a terminal smaller than 12 rows or 30 columns, the prompt is a plain "you>" line and replies are plain text. Ctrl-C ends the session and gives the terminal its whole screen back. Commands:
+The session. On a terminal, chat and agent sessions take the whole screen (your previous screen comes back when you leave), like Claude Code: the conversation scrolls in the upper part, and the input box (two rules, the line you type, a status line) stays at the bottom. Your messages are shaded and marked ❯, the model's replies start with ● and are rendered as Markdown. While the model thinks or a tool runs, the status line shows a spinner, what is happening and for how long (and how many files a search has looked at). Keys: Enter sends, Shift+Enter (or Alt+Enter) starts a new line, Up/Down recall earlier messages, PgUp/PgDn or the mouse wheel scroll the conversation (Ctrl+Home / Ctrl+End jump to the top / bottom), Ctrl-C clears the box or, on an empty box, ends the session, Ctrl-L repaints. You can type while the model works; Enter then queues the message. Without a terminal (pipes, NO_COLOR) the session is line-oriented: a "you>" prompt and plain replies. Commands:
 
     /help                 list the commands
     /mode [default|edits|plan]   bare /mode cycles default -> edits -> plan (like shift-tab in Claude Code)
@@ -82,11 +82,12 @@ The session. Your input sits between two rules with a status line (model, level,
     /status               model, level, mode, folders, sandbox, shell, project notes, context size
     /rules                your allow/deny rules and this session's "always" answers
     /todos                the model's task list
-    !COMMAND              run a command yourself in your shell, in the first folder, on this terminal (sudo and
-                          installers can ask their questions); the model is told it ran and its exit code
+    !COMMAND              run a command yourself in your shell, in the first folder, on the normal terminal screen
+                          (sudo and installers can ask their questions; press Enter to come back); the model is told
+                          it ran and its exit code
     /exit                 end the session
 
-Approvals. Every change and every risky action shows exactly what will happen (diffs for edits, the full command for shells) and asks `[y/N/a]`: y = yes, a = always for this exact action for the rest of the session, anything else = no. Answering a on a file edit turns on edits mode: later edits inside the allowed folders are approved automatically (deletes, plan approval and worktree switches are always asked). Nothing is remembered across sessions; for that write rules (below).
+Approvals. Every change and every risky action shows exactly what will happen (diffs for edits, the full command for shells) and then a menu: 1. Yes, 2. Yes and don't ask again for this exact action this session (for file edits: allow all edits in these folders this session), 3. No. Choose with the arrow keys and Enter, the number keys, y / a / n, Esc (= No), or a mouse click. In a line-oriented session the same question is asked as `[y/N/a]`. Answering a on a file edit turns on edits mode: later edits inside the allowed folders are approved automatically (deletes, plan approval and worktree switches are always asked). Nothing is remembered across sessions; for that write rules (below).
 
 Project notes. If the first folder contains AIMGR.md (or else AGENTS.md, or else CLAUDE.md), it is added to the instructions at the start of the session, like CLAUDE.md in Claude Code. Use it for build commands and conventions.
 

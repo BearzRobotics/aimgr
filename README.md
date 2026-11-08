@@ -17,7 +17,7 @@ Highlights: a ~150-model bundled catalog with access (open / sign-in / cloud) an
 ## Chat and agent sessions
 
 `aimgr chat <backend> <model>` (or `c` in the TUI) and `aimgr agent <backend> <model>` (or `g`) share one
-interface: you type between two rules with a status line under them, pinned at the bottom of the terminal while everything scrolls above, your sent messages are shaded and marked `❯`,
+full-screen interface like Claude Code: the conversation scrolls (PgUp/PgDn, mouse wheel) above an input box pinned at the bottom with a live status line; approvals are a menu you answer with arrows, numbers or the mouse; your sent messages are shaded and marked `❯`,
 replies start with `●` and are rendered as Markdown. Chat has no tools; `aimgr chat --raw` runs the backend's own chat.
 
 ### Agent
