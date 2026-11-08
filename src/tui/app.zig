@@ -473,7 +473,9 @@ fn chat(app: *App) void {
     if (!row.installed) return app.setMessage(true, "only installed models can be chatted with", .{});
     if (row.access == .cloud) return app.setMessage(true, "this is a cloud model: it runs remotely and needs sign-in + API usage, so aimgr (offline-first) will not launch it; use ollama directly if you want that", .{});
     const be = row.model.backend;
-    const pl = launcher.plan(app.frame.allocator(), be, .chat, row.model.id, .{}) catch |e| return app.setMessage(true, "{s}", .{launcher.errorText(e)});
+    const fa = app.frame.allocator();
+    const exe = std.process.executablePathAlloc(app.io, fa) catch return app.setMessage(true, "cannot locate the aimgr executable", .{});
+    const pl: launcher.Plan = .{ .argv = fa.dupe([]const u8, &.{ exe, "chat", be.name(), row.model.id }) catch return };
     term.suspendTerm();
     var ob: [1024]u8 = undefined;
     var eb: [1024]u8 = undefined;

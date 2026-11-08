@@ -14,7 +14,13 @@ zig build -Doptimize=ReleaseSafe
 Highlights: a ~150-model bundled catalog with access (open / sign-in / cloud) and good-for tags, `aimgr browse`, `aimgr list --fit`, `aimgr hardware`, `aimgr search`, `aimgr chat|serve|pull|update|remove`,
 `aimgr agent` (let a tool-capable local model inspect a directory under strict, per-model guardrails), `aimgr abliterate` (create an abliterated copy of a model).
 
-## Agent sessions
+## Chat and agent sessions
+
+`aimgr chat <backend> <model>` (or `c` in the TUI) and `aimgr agent <backend> <model>` (or `g`) share one
+interface: you type between two rules with a status line under them, your sent messages are shaded and marked `❯`,
+replies start with `●` and are rendered as Markdown. Chat has no tools; `aimgr chat --raw` runs the backend's own chat.
+
+### Agent
 
 `aimgr agent <ollama|llama> <model>` (or `g` in the TUI) works in the current folder after you trust it once.
 Like Claude Code: `AIMGR.md` / `AGENTS.md` / `CLAUDE.md` project notes, approvals with `y` / `a` (always this

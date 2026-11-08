@@ -15,6 +15,7 @@ const Audit = envm.Audit;
 const State = envm.State;
 
 fn systemPrompt(arena: std.mem.Allocator, s: policy.Settings, st: *const State) ![]u8 {
+    if (s.level == .off) return arena.dupe(u8, "You are a helpful assistant running locally on the user's computer. Answer clearly and concisely; use Markdown when it helps. You have no tools and cannot see the user's files.");
     var dirs: std.ArrayList(u8) = .empty;
     for (s.dirs, 0..) |d, i| try dirs.print(arena, "{s}{s}", .{ if (i > 0) ", " else "", d });
     const role: []const u8 = if (st.unattended) "You are running UNATTENDED as a scheduled task: nobody is present. You can only read; anything that needs approval is denied. Do the task and finish with a concise report." else if (st.depth > 0) "You are a SUB-AGENT: do the one task you are given, use only reading tools, and finish with a short report of what you found (no questions to the user)." else "You are a local assistant running on the user's computer. You can look at files with tools.";
@@ -90,7 +91,7 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
         _ = turn.reset(.retain_capacity);
         const ta = turn.allocator();
         // Rebuilt every time: plan mode, or a plan being approved, changes what the model may use.
-        const schemas = try tools.schemasForFeatures(ta, featuresFor(e, s, st));
+        const schemas = if (s.level == .off) "" else try tools.schemasForFeatures(ta, featuresFor(e, s, st));
         const body = try chat.requestBody(ta, e.api, e.model, msgs.items, schemas, 8192);
         const reply = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body) catch |er| {
             switch (er) {
@@ -193,14 +194,17 @@ fn printReply(e: Env, ta: std.mem.Allocator, indent: []const u8, text: []const u
         if (md.Document.parse(e.gpa, text, .{ .extensions = md.Extensions.gfm })) |doc_c| {
             var doc = doc_c;
             defer doc.deinit();
-            if (doc.toTextAlloc(e.gpa, .{ .width = e.width, .color = e.color, .unicode = true })) |rendered| {
+            const cols: usize = @import("../platform.zig").termWidth() orelse e.width;
+            if (doc.toTextAlloc(e.gpa, .{ .width = @max(20, cols -| 3), .color = e.color, .unicode = true })) |rendered| {
                 defer e.gpa.free(rendered);
-                try e.out.print("\n{s}{s}\n", .{ if (e.color) "\x1b[1;36m●\x1b[0m " else "* ", std.mem.trim(u8, rendered, "\n") });
+                // Continuation lines are indented under the bullet, like Claude Code.
+                const body = std.mem.trim(u8, rendered, "\n");
+                const indented = try std.mem.replaceOwned(u8, ta, body, "\n", "\n  ");
+                try e.out.print("\n{s}{s}\n", .{ if (e.color) "\x1b[1;36m●\x1b[0m " else "* ", indented });
                 return;
             } else |_| {}
         } else |_| {}
     }
-    _ = ta;
     try e.out.print("\n{s}assistant> {s}\n", .{ indent, text });
 }
 
@@ -243,6 +247,39 @@ fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(
     try e.out.print("[exit code {d}]\n", .{code});
     try msgs.append(ha, .{ .role = .user, .content = try std.fmt.allocPrint(ha, "(I ran this command myself in my terminal: `{s}`; it exited with code {d}. Its output was shown to me, not to you.)", .{ command, code }) });
     try msgs.append(ha, .{ .role = .assistant, .content = "Noted." });
+}
+
+/// The input prompt. On a colour terminal it looks like Claude Code's: a rule above and below the line you type
+/// on and a status line under it; after Enter your message is redrawn as a shaded block so it stands apart
+/// from the model's replies. Elsewhere (pipes, NO_COLOR, old consoles) it is a plain "you>" line.
+fn readPrompt(e: Env, model: []const u8, s: policy.Settings, st: *const State) !?[]const u8 {
+    if (!e.color) {
+        try e.out.print("\n[{s} · {s} · {s}]\nyou> ", .{ model, s.level.text(), modeText(st) });
+        try e.out.flush();
+        return e.input.line();
+    }
+    const w: usize = @max(20, @min(@as(usize, @import("../platform.zig").termWidth() orelse e.width), 400));
+    var rule_buf: [400 * 3]u8 = undefined;
+    var n: usize = 0;
+    for (0..w) |_| {
+        @memcpy(rule_buf[n .. n + 3], "─");
+        n += 3;
+    }
+    const rule = rule_buf[0..n];
+    const level_txt = if (s.level == .off) "chat" else s.level.text();
+    try e.out.print("\n\x1b[2m{s}\x1b[0m\n\n\x1b[2m{s}\x1b[0m\n\x1b[2m  {s} · {s} · {s}   /help · !command · /exit\x1b[0m\x1b[2A\r\x1b[1;36m❯\x1b[0m ", .{ rule, rule, model, level_txt, modeText(st) });
+    try e.out.flush();
+    const line = e.input.line() orelse {
+        try e.out.writeAll("\x1b[2B\n");
+        return null;
+    };
+    // Enter left the cursor on the line under the last row of input: go back to the top rule and redraw.
+    const cols = (std.unicode.utf8CountCodepoints(line) catch line.len) + 2;
+    const rows = @max(1, (cols + w - 1) / w);
+    try e.out.print("\x1b[{d}A\r\x1b[J", .{rows + 1});
+    if (line.len > 0) try e.out.print("\x1b[48;5;237m\x1b[97m ❯ {s} \x1b[0m\n", .{line});
+    try e.out.flush();
+    return line;
 }
 
 fn modeText(st: *const State) []const u8 {
@@ -307,22 +344,24 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
     var msgs: std.ArrayList(chat.Msg) = .empty;
     try msgs.append(ha, .{ .role = .system, .content = try std.mem.concat(ha, u8, &.{ try systemPrompt(ha, s, &st), notes_suffix }) });
 
-    try e.out.print("agent ready: model {s}, level {s}, directories: ", .{ model, s.level.text() });
-    for (s.dirs, 0..) |d, i| try e.out.print("{s}{s}", .{ if (i > 0) ", " else "", d });
-    try e.out.print("\nsandbox: {s}. shell: {s}. web: {s}. sub-agents: {s}.\n", .{
-        if (sandbox_on) "on (bubblewrap, no network)" else "off",
-        policy.effectiveShell(s).text(),
-        if (s.web) "on (each request asks)" else "off",
-        if (s.subagents) "on" else "off",
-    });
+    if (s.level == .off) {
+        try e.out.print("chat with {s} (no tools: the model cannot see or change anything on this computer). /help for commands, /exit to leave.\n", .{model});
+    } else try e.out.print("agent ready: model {s}, level {s}, directories: ", .{ model, s.level.text() });
+    if (s.level != .off) {
+        for (s.dirs, 0..) |d, i| try e.out.print("{s}{s}", .{ if (i > 0) ", " else "", d });
+        try e.out.print("\nsandbox: {s}. shell: {s}. web: {s}. sub-agents: {s}.\n", .{
+            if (sandbox_on) "on (bubblewrap, no network)" else "off",
+            policy.effectiveShell(s).text(),
+            if (s.web) "on (each request asks)" else "off",
+            if (s.subagents) "on" else "off",
+        });
+    }
     if (notes_path) |p| try e.out.print("project notes: {s}\n", .{p});
-    try e.out.writeAll("Type a request, or /help. Every change is shown before it happens; answer 'a' to stop asking for the same thing.\n");
+    if (s.level != .off) try e.out.writeAll("Type a request, or /help. Every change is shown before it happens; answer 'a' to stop asking for the same thing.\n");
     if (st.plan_mode) try e.out.writeAll("PLAN MODE: only reading tools until you approve a plan.\n");
 
     while (true) {
-        try e.out.print("\n[{s} · {s} · {s}]\nyou> ", .{ model, s.level.text(), modeText(&st) });
-        try e.out.flush();
-        const user = e.input.line() orelse return 0;
+        const user = (try readPrompt(e, model, s, &st)) orelse return 0;
         if (user.len == 0) continue;
         if (std.mem.eql(u8, user, "/exit") or std.mem.eql(u8, user, "/quit")) return 0;
         if (user[0] == '!') {

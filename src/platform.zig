@@ -18,6 +18,11 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) c_uint;
     extern "kernel32" fn GetProcessId(h: HANDLE) callconv(.winapi) c_uint;
+    const COORD = extern struct { x: i16, y: i16 };
+    const SMALL_RECT = extern struct { left: i16, top: i16, right: i16, bottom: i16 };
+    const CSBI = extern struct { size: COORD, cursor: COORD, attributes: u16, window: SMALL_RECT, max_size: COORD };
+    extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *CSBI) callconv(.winapi) c_int;
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: [*:0]const u16) callconv(.winapi) c_int;
     extern "kernel32" fn SetConsoleCtrlHandler(cb: ?*const fn (c_uint) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
 } else struct {};
@@ -117,4 +122,19 @@ pub fn prependPath(arena: std.mem.Allocator, env: *std.process.Environ.Map, dir:
     const k = std.unicode.utf8ToUtf16LeAllocZ(arena, "PATH") catch return;
     const v = std.unicode.utf8ToUtf16LeAllocZ(arena, joined) catch return;
     _ = win.SetEnvironmentVariableW(k, v);
+}
+
+/// Columns of the terminal on stdout, or null when stdout is not a terminal.
+pub fn termWidth() ?u16 {
+    if (is_windows) {
+        const h = win.GetStdHandle(@bitCast(@as(i32, -11))) orelse return null; // STD_OUTPUT_HANDLE
+        var info: win.CSBI = undefined;
+        if (win.GetConsoleScreenBufferInfo(h, &info) == 0) return null;
+        const w = info.window.right - info.window.left + 1;
+        return if (w > 0) @intCast(w) else null;
+    }
+    var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
+    const rc = std.posix.system.ioctl(1, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
+    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return null;
+    return ws.col;
 }

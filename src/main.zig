@@ -19,8 +19,8 @@ const usage =
     \\  probe    show backend availability and versions
     \\  list     list installed models from every backend
     \\             [--backend ollama|llama] [--filter TEXT] [--abliterated] [--use TAG] [--access open|signin|cloud] [--fit]
-    \\  chat     run a model interactively (offline; model must be installed)
-    \\             chat <ollama|llama> <model> [--ctx N] [--gpu-layers N|auto|all]
+    \\  chat     talk to an installed model (no tools; same interface as agent): chat <ollama|llama> <model>
+    \\             chat --raw <ollama|llama> <model> [--ctx N] [--gpu-layers N|auto|all]   the backend's own chat
     \\  serve    run an API server, bound to 127.0.0.1 unless confirmed
     \\             serve <ollama|llama> [model] [--host H] [--port P] [--ctx N] [--gpu-layers N|auto|all]
     \\             (llama needs a model; ollama serve takes none and reuses a running daemon)
@@ -38,6 +38,12 @@ pub const panic = std.debug.FullPanic(panicRestore);
 fn panicRestore(msg: []const u8, first_trace_addr: ?usize) noreturn {
     aimgr.term.deinit();
     std.debug.defaultPanic(msg, first_trace_addr);
+}
+
+/// `chat --raw`, or backend options only the backend's own chat understands, keep the backend CLI.
+fn wantsRawChat(args: []const [:0]const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a, "--raw") or std.mem.eql(u8, a, "--ctx") or std.mem.eql(u8, a, "--gpu-layers")) return true;
+    return false;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -113,12 +119,17 @@ pub fn main(init: std.process.Init) !u8 {
             try loadCatalog(arena, init.gpa, io, init.environ_map, &cat, err);
             code = try printList(arena, init.gpa, io, out, err, report, &cat, opts);
         }
+    } else if (std.mem.eql(u8, cmd, "chat") and !wantsRawChat(args[2..])) {
+        const report = inv.discover(arena, init.gpa, io);
+        code = try aimgr.agent_cmd.chatMain(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
     } else if (std.mem.eql(u8, cmd, "chat") or std.mem.eql(u8, cmd, "serve")) {
         const report = inv.discover(arena, init.gpa, io);
         const log_dir = try aimgr.config.statePath(arena, init.environ_map, "logs");
         const env: aimgr.supervise.Env = .{ .gpa = init.gpa, .io = io, .environ = init.environ_map, .out = out, .err = err, .log_dir = log_dir };
         const mode: aimgr.launcher.Mode = if (cmd[0] == 'c') .chat else .server;
-        code = try aimgr.launch_cmd.run(env, report, arena, mode, args[2..]);
+        var rest: std.ArrayList([:0]const u8) = .empty;
+        for (args[2..]) |a| if (!std.mem.eql(u8, a, "--raw")) try rest.append(arena, a);
+        code = try aimgr.launch_cmd.run(env, report, arena, mode, rest.items);
     } else if (std.mem.eql(u8, cmd, "pull") or std.mem.eql(u8, cmd, "update") or std.mem.eql(u8, cmd, "remove")) {
         const report = inv.discover(arena, init.gpa, io);
         const env: aimgr.supervise.Env = .{ .gpa = init.gpa, .io = io, .environ = init.environ_map, .out = out, .err = err, .log_dir = null };

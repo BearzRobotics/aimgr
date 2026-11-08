@@ -36,7 +36,8 @@ curl|sh, sudo; `sudo/su/doas/pkexec` refused unless allow_root. No allowlist, no
 | allow/deny rules (`allow_rule=` / `deny_rule=`) | done; deny wins; allow only answers prompts, never overrides a refusal; a wildcard allow does not cover shell commands containing `; | & < > $ ( ) ` or newlines; verified live (rule-approved edit, prompted edit, denied read) |
 | run_background / check_background / stop_background | done; approved per start, sandboxed, max 4, all stopped at session end (verified: no leftover process), bwrap --die-with-parent / setpriv --pdeathsig if aimgr is killed |
 | enter_worktree / exit_worktree | done; verified live in a scratch repo (branch aimgr/<name> under <dir>/.aimgr-worktrees, work happens there, main checkout untouched) |
-| scheduling: done (aimgr schedule, unattended, read-only/inspect) · MCP client: done (stdio, mcp.toml, level ask, approval per call unless read_only_tools; servers are NOT sandboxed) |
+| scheduling (`aimgr schedule`) | done; unattended, level read-only/inspect only, approvals denied and recorded; verified live (read worked, delete denied, result file written) |
+| MCP client (stdio, `mcp.toml`) | done; level ask, approval per call unless `read_only_tools`; servers are NOT sandboxed; verified live with a test server |
 
 Fixes found by these runs: approval prompt printed `[y/N]` before the question; the sub-agent report string leaked
 (allocated outside the arena that frees it).

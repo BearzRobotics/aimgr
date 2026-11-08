@@ -278,7 +278,7 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
         renv.color = !no_color and (!policy.is_windows or env.get("WT_SESSION") != null);
         if (env.get("COLUMNS")) |c| renv.width = std.fmt.parseInt(u16, c, 10) catch 100;
     }
-    try out.print("audit log: {s}\n", .{audit orelse "(none)"});
+    if (s.level != .off) try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
     if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena);
 
@@ -295,7 +295,8 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
     if (checked) |v| capcache.record(arena, gpa, io, env, .llama, id, v); // remembered for the Settings tab
     switch (checked orelse false) {
         true => {},
-        false => {
+        // Plain chat (level off) needs no tool support.
+        false => if (s.level != .off) {
             try err.print("aimgr: this model's chat template does not support tool calls, so it cannot be used in agent mode. Pick a model tagged [tools] in 'aimgr list'.\n", .{});
             return 1;
         },
@@ -395,4 +396,32 @@ test "trusted dir matching" {
     try std.testing.expect(isTrusted("/stuff\n", "/stuff/git/x"));
     try std.testing.expect(!isTrusted("/stuff\n", "/stuffy"));
     try std.testing.expect(!isTrusted("", "/a"));
+}
+
+/// `aimgr chat BACKEND MODEL`: the same interface as agent sessions (input between two rules, Markdown replies,
+/// /clear, /compact, !command) but without any tools. `aimgr chat --raw ...` runs the backend's own CLI instead.
+pub fn chatMain(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, out: *std.Io.Writer, err: *std.Io.Writer, report: inventory.Inventory, args: []const [:0]const u8) !u8 {
+    if (args.len != 2) {
+        try err.writeAll("usage: aimgr chat <ollama|llama> <model>   (aimgr chat --raw ... runs the backend's own chat, with --ctx / --gpu-layers)\n");
+        return 2;
+    }
+    const kind = std.meta.stringToEnum(backend.Kind, args[0]) orelse {
+        try err.writeAll("aimgr: backend must be ollama or llama\n");
+        return 2;
+    };
+    const id = args[1];
+    for (report.reports) |r| if (r.kind == kind and r.probe != .available) {
+        try err.print("aimgr: {s} is unavailable\n", .{kind.name()});
+        return 1;
+    };
+    if (!inventoryHas(report, kind, id)) {
+        try err.print("aimgr: '{s}' is not installed in {s} (exact id required; see 'aimgr list')\n", .{ id, kind.name() });
+        return 1;
+    }
+    if (catalog_io.loadAll(arena, gpa, io, env) catch null) |l| if (l.cat.find(kind, id)) |ent| if (ent.access == .cloud) {
+        try err.writeAll("aimgr: that is a cloud model: it runs remotely and needs sign-in and API usage, so aimgr (offline-first) will not launch it\n");
+        return 1;
+    };
+    const s: policy.Settings = .{ .level = .off, .subagents = false, .max_steps = 1, .sandbox = .none };
+    return launch(arena, gpa, io, env, out, err, kind, id, s, .interactive);
 }
