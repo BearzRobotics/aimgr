@@ -1,0 +1,5 @@
+number of models in cache: 4
+   1. ggml-org/gpt-oss-20b-GGUF:MXFP4
+   2. ggml-org/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M
+   3. Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M
+   4. ggml-org/Qwen3.5-0.8B-GGUF:Q8_0

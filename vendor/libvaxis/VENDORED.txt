@@ -1,0 +1,1 @@
+libvaxis commit 74b7d916c8879e5379f428ea8c4d43d1a1bb061b (main, 'build: update to zig 0.17.1'), MIT. Patched: build.zig.zon uucode dependency -> path ../uucode (was git URL, lazy).

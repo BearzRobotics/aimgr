@@ -1,0 +1,14 @@
+# Installed by `aimgr abliterate setup` into an aimgr-managed venv (never system Python).
+# CPU-only torch wheels are used because no GPU is required or assumed.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers
+huggingface_hub
+safetensors
+pyarrow
+numpy
+sentencepiece
+protobuf
+tqdm
+pyyaml
+requests

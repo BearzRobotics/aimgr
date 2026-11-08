@@ -1,0 +1,2 @@
+NAME           ID              SIZE     MODIFIED           
+qwen3.8:27b    aaee06c39dcf    17 GB    About a minute ago    

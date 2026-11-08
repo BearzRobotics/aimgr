@@ -1,0 +1,36 @@
+# Bundled seed catalog for aimgr. Entries are matched to installed models by
+# exact backend + id first, then by explicit aliases. Unknown models stay
+# visible without metadata. Descriptions are brief, general and unverified
+# against the installed files; user overlay: ~/.config/aimgr/models.toml.
+
+[[model]]
+backend = "llama"
+id = "ggml-org/gpt-oss-20b-GGUF:MXFP4"
+name = "gpt-oss 20B"
+access = "open"
+description = "OpenAI's open-weight 20B mixture-of-experts reasoning model, MXFP4 quantization."
+use_cases = ["chat", "reasoning", "tools", "long-context"]
+
+[[model]]
+backend = "llama"
+id = "ggml-org/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q4_K_M"
+name = "Qwen3 Coder 30B-A3B"
+access = "open"
+description = "Mixture-of-experts coding model (30B total, about 3B active parameters)."
+use_cases = ["coding"]
+
+[[model]]
+backend = "llama"
+id = "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF:Q4_K_M"
+name = "Qwen2.5 Coder 14B"
+access = "open"
+description = "Dense 14B instruction-tuned coding model."
+use_cases = ["coding"]
+
+[[model]]
+backend = "llama"
+id = "ggml-org/Qwen3.5-0.8B-GGUF:Q8_0"
+name = "Qwen3.5 0.8B"
+access = "open"
+description = "Very small general model; useful for quick tests and low-memory machines."
+use_cases = ["chat", "small"]

@@ -1,0 +1,1 @@
+ggml-org/llama.cpp commit fd27b2034905f8dadd8bd6d2cc44595f4929d391 (the commit of the installed llama 0.9.0-dev build 12182). Files: convert_hf_to_gguf.py, conversion/, gguf-py/gguf (+pyproject). MIT. Unmodified. Executed only inside the abliteration venv.

@@ -1,0 +1,8 @@
+.{
+    .name = .toml,
+    .fingerprint = 0x12c55c532cad3674,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.1",
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "bench", "ai", "docs", "LICENSE", "README.md" },
+}
