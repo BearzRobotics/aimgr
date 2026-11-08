@@ -3,6 +3,7 @@
 //! declined action is simply reported back to it as text.
 const std = @import("std");
 const platform = @import("../platform.zig");
+const activity = @import("activity.zig");
 const chat = @import("chat.zig");
 const policy = @import("policy.zig");
 const tools = @import("tools.zig");
@@ -94,7 +95,11 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
         // Rebuilt every time: plan mode, or a plan being approved, changes what the model may use.
         const schemas = if (s.level == .off) "" else try tools.schemasForFeatures(ta, featuresFor(e, s, st));
         const body = try chat.requestBody(ta, e.api, e.model, msgs.items, schemas, 8192);
-        const reply = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body) catch |er| {
+        try e.out.flush();
+        activity.set("thinking");
+        const sent = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body);
+        activity.clear();
+        const reply = sent catch |er| {
             switch (er) {
                 error.ApiError => try e.err.print("aimgr: the model server said: {s}\n", .{chat.last_error}),
                 error.Unreachable => try e.err.print("aimgr: cannot reach the model server at {s}\n", .{e.host_port}),
@@ -255,6 +260,7 @@ fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(
 /// lines, approvals) scrolls in a terminal scroll region above it, so the box never disappears.
 const Screen = struct {
     on: bool = false,
+    ticking: bool = false,
     rows: u16 = 0,
     cols: u16 = 0,
 
@@ -265,16 +271,17 @@ const Screen = struct {
         const sz = platform.termSize() orelse return;
         if (sz.rows < 12 or sz.cols < 30) return;
         self.* = .{ .on = true, .rows = sz.rows, .cols = sz.cols };
-        // Make room for the box, limit scrolling to the rows above it, park the cursor at the bottom of that region.
-        try e.out.writeAll("\n\n\n\n");
-        try e.out.print("\x1b[1;{d}r\x1b[{d};1H", .{ self.rows - box_rows, self.rows - box_rows });
+        // Like Claude Code: take the whole terminal (alternate screen; your previous screen comes back on exit),
+        // limit scrolling to the rows above the box, start writing at the top.
+        try e.out.print("\x1b[?1049h\x1b[2J\x1b[1;{d}r\x1b[1;1H", .{self.rows - box_rows});
         try e.out.flush();
         platform.onInterrupt(onInterrupt, true);
     }
 
     fn end(self: *Screen, e: Env) void {
         if (!self.on) return;
-        e.out.print("\x1b[r\x1b[{d};1H\x1b[J", .{self.rows - box_rows + 1}) catch {};
+        activity.stop();
+        e.out.writeAll("\x1b[r\x1b[?1049l") catch {};
         e.out.flush() catch {};
         platform.resetInterrupt();
         self.on = false;
@@ -288,14 +295,14 @@ const Screen = struct {
         for (0..self.cols) |_| try e.out.writeAll("─");
         try e.out.print("\x1b[0m\x1b[{d};1H\x1b[2K\x1b[1;36m❯\x1b[0m \x1b[{d};1H\x1b[2K\x1b[2m", .{ r - 2, r - 1 });
         for (0..self.cols) |_| try e.out.writeAll("─");
-        try e.out.print("\x1b[0m\x1b[{d};1H\x1b[2K\x1b[2m  {s}\x1b[0m", .{ r, status[0..@min(status.len, self.cols -| 3)] });
+        try e.out.print("\x1b[0m\x1b[{d};1H\x1b[2K\x1b[2m  {s}\x1b[0m", .{ r, activity.fitCols(status, self.cols -| 3) });
         try e.out.writeAll("\x1b8"); // back to where output continues
     }
 };
 
 /// Ctrl-C during a session: give the terminal its whole screen back before exiting (async-signal-safe).
 fn onInterrupt() void {
-    platform.writeStdoutRaw("\x1b[r\x1b[999;1H\n");
+    platform.writeStdoutRaw("\x1b[r\x1b[?1049l");
     std.process.exit(130);
 }
 
@@ -314,6 +321,10 @@ fn readPrompt(e: Env, scr: *Screen, ta: std.mem.Allocator, model: []const u8, s:
         return e.input.line();
     }
     try scr.drawBox(e, try statusText(ta, model, s, st, "/help · !command · /exit"));
+    if (!scr.ticking) {
+        activity.start(e.io, scr.rows, scr.cols, "");
+        scr.ticking = true;
+    }
     try e.out.writeAll("\x1b7"); // remember where output continues
     try e.out.print("\x1b[{d};3H", .{scr.rows - 2}); // into the input line
     try e.out.flush();
@@ -391,6 +402,9 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
     var msgs: std.ArrayList(chat.Msg) = .empty;
     try msgs.append(ha, .{ .role = .system, .content = try std.mem.concat(ha, u8, &.{ try systemPrompt(ha, s, &st), notes_suffix }) });
 
+    var scr: Screen = .{};
+    try scr.begin(e);
+    defer scr.end(e);
     if (s.level == .off) {
         try e.out.print("chat with {s} (no tools: the model cannot see or change anything on this computer). /help for commands, /exit to leave.\n", .{model});
     } else try e.out.print("agent ready: model {s}, level {s}, directories: ", .{ model, s.level.text() });
@@ -406,9 +420,6 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
     if (notes_path) |p| try e.out.print("project notes: {s}\n", .{p});
     if (s.level != .off) try e.out.writeAll("Type a request, or /help. Every change is shown before it happens; answer 'a' to stop asking for the same thing.\n");
     if (st.plan_mode) try e.out.writeAll("PLAN MODE: only reading tools until you approve a plan.\n");
-    var scr: Screen = .{};
-    try scr.begin(e);
-    defer scr.end(e);
 
     while (true) {
         _ = turn.reset(.retain_capacity);

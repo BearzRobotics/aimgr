@@ -10,6 +10,7 @@ const workflow = @import("workflow.zig");
 
 const Env = envm.Env;
 const mcp = @import("../mcp.zig");
+const activity = @import("activity.zig");
 const State = envm.State;
 
 /// What a rule pattern is matched against, per tool (paths are normalized so rules can use absolute paths).
@@ -60,6 +61,12 @@ fn shellQuote(arena: std.mem.Allocator, argv: []const []const u8) ![]u8 {
 }
 
 pub const Outcome = struct { text: []const u8, decision: []const u8, reason: []const u8 };
+
+/// Show `what` live in the status line while a slow operation runs (the output so far is flushed first).
+pub fn busy(e: Env, what: []const u8) !void {
+    try e.out.flush();
+    activity.set(what);
+}
 
 pub fn ask(e: Env, st: *State, question: []const u8) bool {
     if (st.unattended) {
@@ -226,6 +233,8 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Set
                 .auto => {},
             }
             try e.out.print("  [{s}] {s}  ({s})\n", .{ call.name, norm, how });
+            try busy(e, if (tool == .list_dir) "listing the folder" else "reading the file (PDFs and OCR can take a while)");
+            defer activity.clear();
             const text = if (tool == .list_dir)
                 tools.listDir(arena, e.io, norm, 400) catch |er| return denied(arena, @errorName(er))
             else
@@ -260,7 +269,12 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Set
             const sb = sandbox_on and c.needs != .network;
             try e.out.print("  [run_command] {s}  ({s}{s})\n", .{ shown, how, if (sb) ", sandboxed" else if (c.needs == .network) ", network" else "" });
             const extra_ro: []const []const u8 = if (c.needs == .pkgdb) try tools.pkgDbDirs(arena, e.io) else &.{};
-            const r = try tools.runCommandWith(arena, e.gpa, e.io, s, argv, sb, extra_ro);
+            try busy(e, "running the command");
+            const r = tools.runCommandWith(arena, e.gpa, e.io, s, argv, sb, extra_ro) catch |er| {
+                activity.clear();
+                return er;
+            };
+            activity.clear();
             return .{ .text = r.text, .decision = how, .reason = reason };
         },
         .search_files => {
@@ -275,7 +289,12 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Set
             }
             const ic = if (args.get("ignore_case")) |v| (v == .bool and v.bool) else false;
             try e.out.print("  [search_files] \"{s}\" in {s}  (auto)\n", .{ query, norm });
-            const text = tools.searchFiles(arena, e.io, norm, query, ic, .{}) catch |er| return denied(arena, @errorName(er));
+            try busy(e, "searching text files");
+            const text = tools.searchFiles(arena, e.io, norm, query, ic, .{}) catch |er| {
+                activity.clear();
+                return denied(arena, @errorName(er));
+            };
+            activity.clear();
             return .{ .text = text, .decision = "auto", .reason = "" };
         },
         .edit_file => {

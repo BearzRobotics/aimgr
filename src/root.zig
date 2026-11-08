@@ -34,6 +34,7 @@ pub const agent_policy = @import("agent/policy.zig");
 pub const agent_chat = @import("agent/chat.zig");
 pub const agent_tools = @import("agent/tools.zig");
 pub const agent_pkghint = @import("agent/pkghint.zig");
+pub const agent_activity = @import("agent/activity.zig");
 pub const agent_settings = @import("agent/settings.zig");
 pub const agent_run = @import("agent/run.zig");
 pub const agent_calls = @import("agent/calls.zig");

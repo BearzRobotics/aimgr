@@ -3,6 +3,7 @@
 const std = @import("std");
 const policy = @import("policy.zig");
 const pkghint = @import("pkghint.zig");
+const activity = @import("activity.zig");
 const process = @import("process_shim.zig");
 
 pub const Tool = enum { list_dir, read_file, search_files, find_files, ask_user, update_todos, load_skill, run_command, run_shell, write_file, edit_file, move_file, make_dir, delete_file, submit_plan, spawn_agent, web_fetch, web_search, notify, edit_notebook_cell, run_background, check_background, stop_background, enter_worktree, exit_worktree };
@@ -21,7 +22,7 @@ const schema_write_file =
 ;
 
 const schema_search_files =
-    \\{"type":"function","function":{"name":"search_files","description":"Search the text files under a directory for a literal string (not a regex). Returns path:line: text for each match.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text to find"},"path":{"type":"string","description":"Directory to search (default: the first allowed directory)"},"ignore_case":{"type":"boolean"}},"required":["query"]}}}
+    \\{"type":"function","function":{"name":"search_files","description":"Search the text files under a directory for a literal string (not a regex). Returns path:line: text for each match. PDFs, e-books, images and archives are skipped: to look inside a PDF use read_file on it; to find files by name use find_files.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Text to find"},"path":{"type":"string","description":"Directory to search (default: the first allowed directory)"},"ignore_case":{"type":"boolean"}},"required":["query"]}}}
 ;
 const schema_edit_file =
     \\{"type":"function","function":{"name":"edit_file","description":"Replace exact text in an existing file. old_text must match exactly once (unless replace_all is true). The user is asked to approve every edit. Prefer this over rewriting a whole file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string","description":"Exact text to replace, including whitespace"},"new_text":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["path","old_text","new_text"]}}}
@@ -348,13 +349,24 @@ pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
 
 // ---- search / edit / move / mkdir / delete ----------------------------------------------------
 
+const SearchState = struct { buf: []u8, results: usize = 0, files: usize = 0, skipped_binary: usize = 0, truncated: bool = false };
+
+fn binaryByName(name: []const u8) bool {
+    const ext = std.fs.path.extension(name);
+    for ([_][]const u8{ ".pdf", ".epub", ".mobi", ".djvu", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".ico", ".mp3", ".mp4", ".mkv", ".avi", ".mov", ".flac", ".wav", ".ogg", ".zip", ".gz", ".xz", ".zst", ".bz2", ".7z", ".rar", ".tar", ".iso", ".exe", ".dll", ".so", ".o", ".a", ".bin", ".gguf", ".safetensors", ".pt", ".db", ".sqlite", ".woff", ".woff2", ".ttf", ".otf" }) |b| {
+        if (std.ascii.eqlIgnoreCase(ext, b)) return true;
+    }
+    return false;
+}
+
 pub const SearchLimits = struct { max_results: usize = 100, max_files: usize = 20000, max_depth: usize = 12, max_file_bytes: usize = 512 * 1024 };
 
 /// Literal substring search (ASCII case folding when `ignore_case`). Skips symlinks, binary files and
 /// files that look like they hold secrets. Returns "path:line: text" lines plus a summary.
 pub fn searchFiles(arena: std.mem.Allocator, io: std.Io, root: []const u8, query: []const u8, ignore_case: bool, lim: SearchLimits) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    var st: struct { results: usize = 0, files: usize = 0, skipped_binary: usize = 0, truncated: bool = false } = .{};
+    const buf = try arena.alloc(u8, lim.max_file_bytes); // one buffer for every file (not one per file)
+    var st: SearchState = .{ .buf = buf };
     try searchDir(arena, io, root, query, ignore_case, lim, 0, &out, &st);
     try out.print(arena, "[{d} match(es) in {d} file(s) searched{s}{s}]\n", .{ st.results, st.files, if (st.skipped_binary > 0) ", binary files skipped" else "", if (st.truncated) ", stopped at a limit; narrow the path or query" else "" });
     return out.toOwnedSlice(arena);
@@ -378,13 +390,18 @@ fn searchDir(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8, query: 
                     return;
                 }
                 st.files += 1;
+                activity.count(st.files);
+                // Known binary formats are skipped without opening them (a book library is mostly PDFs).
+                if (binaryByName(e.name)) {
+                    st.skipped_binary += 1;
+                    continue;
+                }
                 var f = dir.openFile(io, e.name, .{}) catch continue;
                 defer f.close(io);
                 const len = f.length(io) catch continue;
-                const want: usize = @intCast(@min(len, lim.max_file_bytes));
-                const buf = arena.alloc(u8, want) catch continue;
-                const n = f.readPositionalAll(io, buf, 0) catch continue;
-                const data = buf[0..n];
+                const want: usize = @intCast(@min(len, st.buf.len));
+                const n = f.readPositionalAll(io, st.buf[0..want], 0) catch continue;
+                const data = st.buf[0..n];
                 if (std.mem.indexOfScalar(u8, data[0..@min(data.len, 2048)], 0) != null) {
                     st.skipped_binary += 1;
                     continue;

@@ -2,6 +2,7 @@
 //! submit_plan, spawn_agent, web_fetch. Same contract as calls.zig: policy first, then the user, then
 //! execution; everything coming back is untrusted data.
 const std = @import("std");
+const activity = @import("activity.zig");
 const policy = @import("policy.zig");
 const tools = @import("tools.zig");
 const envm = @import("env.zig");
@@ -47,7 +48,12 @@ fn findFiles(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, a
         .auto => {},
     }
     try e.out.print("  [find_files] {s} in {s}  (auto)\n", .{ pattern, norm });
-    const text = tools.findFiles(arena, e.io, norm, pattern, 200) catch |er| return calls.denied(arena, @errorName(er));
+    try calls.busy(e, "finding files");
+    const text = tools.findFiles(arena, e.io, norm, pattern, 200) catch |er| {
+        activity.clear();
+        return calls.denied(arena, @errorName(er));
+    };
+    activity.clear();
     return .{ .text = text, .decision = "auto", .reason = "" };
 }
 
@@ -145,7 +151,12 @@ fn runShell(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, sa
     while (lines.next()) |l| try e.out.print("    $ {s}\n", .{l});
     if (warn.len > 0) try e.out.print("    WARNING: {s}\n", .{warn});
     if (!calls.ask(e, st, try std.fmt.allocPrint(arena, "RUN this {s} command{s}?", .{ sh.text(), if (sandbox_on) "" else " WITHOUT a sandbox" }))) return declined("shell");
-    const r = try tools.runShell(arena, e.gpa, e.io, s, sh, shell_path, command, sandbox_on);
+    try calls.busy(e, "running the shell command");
+    const r = tools.runShell(arena, e.gpa, e.io, s, sh, shell_path, command, sandbox_on) catch |er| {
+        activity.clear();
+        return er;
+    };
+    activity.clear();
     return .{ .text = r.text, .decision = "approved", .reason = if (warn.len > 0) warn else "shell" };
 }
 
