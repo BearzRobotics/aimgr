@@ -33,6 +33,7 @@ pub const agent_settings = @import("agent/settings.zig");
 pub const agent_run = @import("agent/run.zig");
 pub const agent_calls = @import("agent/calls.zig");
 pub const agent_extra = @import("agent/extra.zig");
+pub const agent_workflow = @import("agent/workflow.zig");
 pub const agent_env = @import("agent/env.zig");
 pub const agent_llama = @import("agent/llama_server.zig");
 pub const agent_capcache = @import("agent/capcache.zig");

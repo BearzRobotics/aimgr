@@ -249,7 +249,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     var input: run.Input = undefined;
     input.init(io);
     const audit = try config.statePath(arena, env, "agent-audit.log");
-    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env) };
+    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env), .state_dir = config.statePath(arena, env, "agent-bg") catch null };
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
     if (kind == .ollama) return run.session(renv, id, eff.s, sandbox_on);

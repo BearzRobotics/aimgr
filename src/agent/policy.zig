@@ -84,6 +84,11 @@ pub const Settings = struct {
     plan: bool = false,
     /// JSON search endpoint template containing "{q}" for web_search; null = web_search is not offered.
     search_url: ?[]const u8 = null,
+    /// User-written rules "tool(pattern)". A matching deny rule always wins. An allow rule only turns an
+    /// approval prompt into an automatic yes; it never overrides a refusal (outside the directories, secrets,
+    /// sudo, plan mode, level).
+    allow_rules: []const []const u8 = &.{},
+    deny_rules: []const []const u8 = &.{},
 };
 
 /// The shell run_shell would use: only at level `ask`, bash unless configured otherwise.
@@ -340,6 +345,76 @@ fn readOnlyArgsOk(arena: std.mem.Allocator, s: Settings, name: []const u8, argv:
 }
 
 // ---------------------------------------------------------------------------------------------
+// Allow / deny rules, e.g.  run_command(git status*)   run_shell(zig build test)   edit_file(/stuff/Books/notes/*)
+//   deny=web_fetch(*.example.com/*)   *(...) matches any tool. `*` in a pattern matches any characters.
+
+pub const Rule = struct { tool: []const u8, pattern: []const u8 };
+
+pub fn parseRule(rule: []const u8) ?Rule {
+    const open = std.mem.indexOfScalar(u8, rule, '(') orelse return null;
+    if (rule.len < open + 3 or rule[rule.len - 1] != ')' or open == 0) return null;
+    const tool = rule[0..open];
+    const pat = rule[open + 1 .. rule.len - 1];
+    if (pat.len == 0 or pat.len > 300) return null;
+    for (tool) |c| if (!(std.ascii.isLower(c) or c == '_' or c == '*')) return null;
+    for (pat) |c| if (c < 0x20 or c == 0x7f) return null;
+    return .{ .tool = tool, .pattern = pat };
+}
+
+/// `*` matches any run of characters (including none, and including `/`); everything else is literal.
+pub fn wildcardMatch(pat: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    var star: ?usize = null;
+    var mark: usize = 0;
+    while (t < text.len) {
+        if (p < pat.len and pat[p] == '*') {
+            star = p;
+            mark = t;
+            p += 1;
+        } else if (p < pat.len and pat[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if (star) |sp| {
+            p = sp + 1;
+            mark += 1;
+            t = mark;
+        } else return false;
+    }
+    while (p < pat.len and pat[p] == '*') p += 1;
+    return p == pat.len;
+}
+
+/// Characters that give a shell string a second meaning (chaining, redirection, expansion, newlines).
+pub fn hasShellMeta(subject: []const u8) bool {
+    return std.mem.indexOfAny(u8, subject, ";|&<>$`()\n\r\\{}!") != null;
+}
+
+pub const RuleResult = union(enum) {
+    none,
+    allow: []const u8,
+    deny: []const u8,
+};
+
+/// Deny rules first, then allow rules. For shell-type tools an allow rule with a wildcard is ignored when
+/// the command contains shell metacharacters, so `run_shell(git status*)` cannot be used to smuggle `; rm`.
+pub fn ruleCheck(s: Settings, tool: []const u8, subject: []const u8) RuleResult {
+    for (s.deny_rules) |r| {
+        const pr = parseRule(r) orelse continue;
+        if ((std.mem.eql(u8, pr.tool, "*") or std.mem.eql(u8, pr.tool, tool)) and wildcardMatch(pr.pattern, subject)) return .{ .deny = r };
+    }
+    const shellish = std.mem.eql(u8, tool, "run_shell") or std.mem.eql(u8, tool, "run_background");
+    for (s.allow_rules) |r| {
+        const pr = parseRule(r) orelse continue;
+        if (!(std.mem.eql(u8, pr.tool, "*") or std.mem.eql(u8, pr.tool, tool))) continue;
+        if (!wildcardMatch(pr.pattern, subject)) continue;
+        if (shellish and hasShellMeta(subject) and std.mem.indexOfScalar(u8, pr.pattern, '*') != null) continue;
+        return .{ .allow = r };
+    }
+    return .none;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Tests
 
 fn testSettings(level: Level) Settings {
@@ -533,4 +608,46 @@ test "shell availability follows the level" {
     try std.testing.expectEqual(Shell.none, effectiveShell(.{ .level = .read_only, .shell = .bash })); // setting cannot raise the level's reach
     try std.testing.expectEqual(@as(?Shell, .sh), Shell.parse("sh"));
     try std.testing.expectEqual(@as(?Shell, null), Shell.parse("zsh"));
+}
+
+test "rule parsing" {
+    const r = parseRule("run_command(git status*)").?;
+    try std.testing.expectEqualStrings("run_command", r.tool);
+    try std.testing.expectEqualStrings("git status*", r.pattern);
+    try std.testing.expect(parseRule("*(foo)") != null);
+    for ([_][]const u8{ "", "run_command", "run_command()", "(x)", "Run(x)", "run_command(x", "run command(x)", "a(b\nc)" }) |bad| try std.testing.expect(parseRule(bad) == null);
+}
+
+test "wildcards" {
+    try std.testing.expect(wildcardMatch("git status*", "git status -s"));
+    try std.testing.expect(wildcardMatch("git status*", "git status"));
+    try std.testing.expect(!wildcardMatch("git status*", "git push"));
+    try std.testing.expect(wildcardMatch("*.txt", "/a/b/c.txt"));
+    try std.testing.expect(wildcardMatch("/stuff/*/notes/*", "/stuff/Books/notes/a.md"));
+    try std.testing.expect(!wildcardMatch("/stuff/Books/*", "/stuff/Other/x"));
+    try std.testing.expect(wildcardMatch("*", ""));
+    try std.testing.expect(wildcardMatch("a*b*c", "aXXbYYc"));
+    try std.testing.expect(!wildcardMatch("a*b*c", "aXXbYY"));
+    try std.testing.expect(wildcardMatch("exact", "exact") and !wildcardMatch("exact", "exactly"));
+}
+
+test "deny beats allow; shell allow-rules cannot be chained" {
+    const s: Settings = .{
+        .level = .ask,
+        .allow_rules = &.{ "run_command(git status*)", "run_shell(zig build*)", "run_shell(echo hi)", "edit_file(/work/*)" },
+        .deny_rules = &.{ "edit_file(*/secrets/*)", "*(*.pem)" },
+    };
+    try std.testing.expect(ruleCheck(s, "run_command", "git status -s") == .allow);
+    try std.testing.expect(ruleCheck(s, "run_command", "git push") == .none);
+    try std.testing.expect(ruleCheck(s, "edit_file", "/work/a.txt") == .allow);
+    try std.testing.expect(ruleCheck(s, "edit_file", "/work/secrets/a.txt") == .deny); // deny wins over the allow above
+    try std.testing.expect(ruleCheck(s, "read_file", "/x/key.pem") == .deny); // any tool
+    // run_shell: a wildcard allow does not cover chained / redirected / expanded commands
+    try std.testing.expect(ruleCheck(s, "run_shell", "zig build test") == .allow);
+    try std.testing.expect(ruleCheck(s, "run_shell", "zig build && rm -rf ~") == .none);
+    try std.testing.expect(ruleCheck(s, "run_shell", "zig build; id") == .none);
+    try std.testing.expect(ruleCheck(s, "run_shell", "zig build $(id)") == .none);
+    try std.testing.expect(ruleCheck(s, "run_shell", "echo hi") == .allow); // exact rule, no wildcard
+    try std.testing.expect(ruleCheck(s, "run_shell", "echo hi; id") == .none);
+    try std.testing.expect(hasShellMeta("a | b") and hasShellMeta("a\nb") and !hasShellMeta("zig build test"));
 }

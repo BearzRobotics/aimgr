@@ -6,9 +6,32 @@ const policy = @import("policy.zig");
 const tools = @import("tools.zig");
 const envm = @import("env.zig");
 const extra = @import("extra.zig");
+const workflow = @import("workflow.zig");
 
 const Env = envm.Env;
 const State = envm.State;
+
+/// What a rule pattern is matched against, per tool (paths are normalized so rules can use absolute paths).
+fn ruleSubjects(arena: std.mem.Allocator, s: policy.Settings, tool: tools.Tool, args: std.json.ObjectMap) ![2]?[]const u8 {
+    const base = if (s.dirs.len > 0) s.dirs[0] else "/";
+    const norm = struct {
+        fn f(a: std.mem.Allocator, b: []const u8, p: ?[]const u8) !?[]const u8 {
+            const path = p orelse return null;
+            if (path.len == 0 or path.len > 4096) return null;
+            return try policy.normalizePath(a, b, path);
+        }
+    }.f;
+    return switch (tool) {
+        .list_dir, .read_file, .write_file, .edit_file, .make_dir, .delete_file, .edit_notebook_cell => .{ try norm(arena, base, getStr(args, "path")), null },
+        .search_files, .find_files => .{ try norm(arena, base, getStr(args, "path") orelse base), null },
+        .move_file => .{ try norm(arena, base, getStr(args, "from")), try norm(arena, base, getStr(args, "to")) },
+        .run_command, .run_shell, .run_background => .{ getStr(args, "command"), null },
+        .web_fetch => .{ getStr(args, "url"), null },
+        .web_search => .{ getStr(args, "query"), null },
+        .notify => .{ getStr(args, "title"), null },
+        else => .{ null, null },
+    };
+}
 
 pub fn getStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const v = obj.get(key) orelse return null;
@@ -38,6 +61,10 @@ fn shellQuote(arena: std.mem.Allocator, argv: []const []const u8) ![]u8 {
 pub const Outcome = struct { text: []const u8, decision: []const u8, reason: []const u8 };
 
 pub fn ask(e: Env, st: *State, question: []const u8) bool {
+    if (st.rule_allow) |rule| {
+        e.out.print("\n  (approved automatically by your rule {s})\n", .{rule}) catch {};
+        return true;
+    }
     e.out.print("\n  ? {s}{s}{s}{s}  [y/N] ", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question }) catch return false;
     e.out.flush() catch return false;
     const l = e.input.line() orelse return false;
@@ -59,12 +86,15 @@ pub fn denied(arena: std.mem.Allocator, reason: []const u8) !Outcome {
 
 /// Run one tool call through policy and (if needed) the user. Never returns an error for model mistakes:
 /// those become text for the model.
-pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, sandbox_on: bool, call: chat.Call) anyerror!Outcome {
+pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Settings, sandbox_on: bool, call: chat.Call) anyerror!Outcome {
+    // Inside a git worktree the working directory is the worktree (the originals stay allowed).
+    const s = try workflow.view(arena, s_in, st);
     const tool = tools.toolFromName(call.name) orelse return denied(arena, "unknown tool");
     const level_ok = switch (tool) {
         .list_dir, .read_file, .search_files, .find_files, .ask_user, .update_todos, .load_skill => s.level.atLeast(.read_only),
         .run_command, .notify => s.level.atLeast(.inspect),
-        .write_file, .edit_file, .move_file, .make_dir, .delete_file, .run_shell, .edit_notebook_cell => s.level == .ask,
+        .write_file, .edit_file, .move_file, .make_dir, .delete_file, .run_shell, .edit_notebook_cell, .enter_worktree, .exit_worktree => s.level == .ask,
+        .run_background, .check_background, .stop_background => s.level == .ask and policy.effectiveShell(s) != .none,
         .submit_plan => s.level.atLeast(.read_only) and st.plan_mode,
         .spawn_agent => s.level.atLeast(.read_only) and s.subagents and st.depth == 0,
         .web_fetch => s.level.atLeast(.read_only) and s.web,
@@ -73,7 +103,7 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settin
     if (!level_ok) return denied(arena, "this tool is not enabled at the current autonomy level or settings");
     // Plan mode: whatever the model asks for by name, nothing that changes state, runs code or reaches out.
     if (st.plan_mode) switch (tool) {
-        .run_command, .run_shell, .write_file, .edit_file, .move_file, .make_dir, .delete_file, .spawn_agent, .web_fetch, .web_search, .notify, .edit_notebook_cell => return denied(arena, "plan mode: only reading tools work until the user approves a plan (use submit_plan)"),
+        .run_command, .run_shell, .write_file, .edit_file, .move_file, .make_dir, .delete_file, .spawn_agent, .web_fetch, .web_search, .notify, .edit_notebook_cell, .run_background, .check_background, .stop_background, .enter_worktree, .exit_worktree => return denied(arena, "plan mode: only reading tools work until the user approves a plan (use submit_plan)"),
         else => {},
     };
 
@@ -81,8 +111,21 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settin
     if (parsed.value != .object) return denied(arena, "arguments must be an object");
     const args = parsed.value.object;
 
+    // The user's own rules: a matching deny always wins; an allow rule answers approval prompts.
+    st.rule_allow = null;
+    defer st.rule_allow = null;
+    for (try ruleSubjects(arena, s, tool, args)) |subject| {
+        const subj = subject orelse continue;
+        switch (policy.ruleCheck(s, @tagName(tool), subj)) {
+            .deny => |r| return denied(arena, try std.fmt.allocPrint(arena, "denied by your rule {s}", .{r})),
+            .allow => |r| st.rule_allow = r,
+            .none => {},
+        }
+    }
+
     switch (tool) {
         .find_files, .ask_user, .update_todos, .load_skill, .run_shell, .submit_plan, .spawn_agent, .web_fetch, .web_search, .notify, .edit_notebook_cell => return extra.handle(e, st, arena, s, sandbox_on, tool, args),
+        .run_background, .check_background, .stop_background, .enter_worktree, .exit_worktree => return workflow.handle(e, st, arena, s, sandbox_on, tool, args),
         .list_dir, .read_file => {
             const path = getStr(args, "path") orelse return denied(arena, "missing 'path'");
             const norm = tools.resolve(arena, e.io, s, path, true) catch |er| return denied(arena, switch (er) {

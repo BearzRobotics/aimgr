@@ -1,6 +1,7 @@
 //! Shared types for agent sessions: the single stdin reader, the environment, session state and the audit log.
 const std = @import("std");
 const chat = @import("chat.zig");
+const process = std.process;
 
 /// One stdin reader shared by the prompt and all approvals (two buffered readers would lose input).
 pub const Input = struct {
@@ -36,6 +37,8 @@ pub const Env = struct {
     home: ?[]const u8 = null,
     /// Directory of user-written skill files (*.md), if it exists.
     skills_dir: ?[]const u8 = null,
+    /// Where background task logs go ($XDG_STATE_HOME/aimgr/agent-bg).
+    state_dir: ?[]const u8 = null,
 };
 
 pub const Audit = struct {
@@ -82,6 +85,24 @@ pub const Audit = struct {
     }
 };
 
+/// A background task started by run_background (owned by the session; stopped when it ends).
+pub const Bg = struct {
+    id: u32,
+    pid: i32,
+    log_path: []const u8,
+    command: []const u8,
+    child: process.Child,
+    exit_code: ?u8 = null,
+    reaped: bool = false,
+};
+
+/// The active git worktree (all strings owned by the gpa).
+pub const Worktree = struct {
+    path: []const u8,
+    branch: []const u8,
+    toplevel: []const u8,
+};
+
 pub const Todo = struct {
     text: []const u8,
     status: enum { pending, in_progress, done },
@@ -104,4 +125,10 @@ pub const State = struct {
     spawned: u32 = 0,
     /// The session's audit log (shared with sub-agents).
     audit: ?*Audit = null,
+    bg: std.ArrayList(Bg) = .empty,
+    next_bg: u32 = 1,
+    worktree: ?Worktree = null,
+    /// Set for the duration of one tool call when one of the user's allow rules matched: the approval
+    /// prompt is then answered "yes" automatically (and says which rule did it).
+    rule_allow: ?[]const u8 = null,
 };

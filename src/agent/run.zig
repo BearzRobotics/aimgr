@@ -7,6 +7,7 @@ const policy = @import("policy.zig");
 const tools = @import("tools.zig");
 const envm = @import("env.zig");
 const calls = @import("calls.zig");
+const workflow = @import("workflow.zig");
 
 pub const Input = envm.Input;
 pub const Env = envm.Env;
@@ -148,6 +149,7 @@ pub fn session(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool)
     defer {
         for (st.todos.items) |t| e.gpa.free(t.text);
         st.todos.deinit(e.gpa);
+        workflow.cleanup(e, &st); // stops every background task this session started
     }
 
     var msgs: std.ArrayList(chat.Msg) = .empty;

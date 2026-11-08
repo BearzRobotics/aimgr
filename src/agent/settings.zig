@@ -39,6 +39,8 @@ pub const Entry = struct {
     subagents: ?bool = null,
     plan: ?bool = null,
     search_url: ?[]const u8 = null,
+    allow_rules: ?[]const []const u8 = null,
+    deny_rules: ?[]const []const u8 = null,
 };
 
 pub const Error = error{ InvalidEntry, OutOfMemory };
@@ -60,6 +62,8 @@ pub fn apply(base: policy.Settings, e: ?Entry) policy.Settings {
     if (ent.subagents) |v| s.subagents = v;
     if (ent.plan) |v| s.plan = v;
     if (ent.search_url) |v| s.search_url = v;
+    if (ent.allow_rules) |v| s.allow_rules = v;
+    if (ent.deny_rules) |v| s.deny_rules = v;
     return s;
 }
 
@@ -116,6 +120,9 @@ pub fn parse(arena: std.mem.Allocator, gpa: std.mem.Allocator, text: []const u8)
         e.max_output_kb = try intOpt(t, "max_output_kb", 1, 4096);
         e.allow_root = t.getBool("allow_root");
         if (t.getString("shell")) |sh| e.shell = policy.Shell.parse(sh) orelse return error.InvalidEntry;
+        e.allow_rules = try strList(arena, t, "allow_rules");
+        e.deny_rules = try strList(arena, t, "deny_rules");
+        inline for (.{ e.allow_rules, e.deny_rules }) |maybe| if (maybe) |rs| for (rs) |r| if (policy.parseRule(r) == null) return error.InvalidEntry;
         e.web = t.getBool("web");
         e.subagents = t.getBool("subagents");
         e.plan = t.getBool("plan");
@@ -163,6 +170,8 @@ pub fn serialize(arena: std.mem.Allocator, entries: []const Entry) ![]u8 {
         if (e.allow_commands) |v| try writeList(w, "allow_commands", v);
         if (e.sandbox) |v| try w.print("sandbox = \"{s}\"\n", .{@tagName(v)});
         if (e.allow_root) |v| try w.print("allow_root = {s}\n", .{if (v) "true" else "false"});
+        if (e.allow_rules) |v| try writeList(w, "allow_rules", v);
+        if (e.deny_rules) |v| try writeList(w, "deny_rules", v);
         if (e.shell) |v| try w.print("shell = \"{s}\"\n", .{v.text()});
         if (e.web) |v| try w.print("web = {s}\n", .{if (v) "true" else "false"});
         if (e.subagents) |v| try w.print("subagents = {s}\n", .{if (v) "true" else "false"});
@@ -231,6 +240,16 @@ pub fn setKey(arena: std.mem.Allocator, e: *Entry, kv: []const u8) SetError!void
     } else if (std.mem.eql(u8, key, "search_url")) {
         if (!validSearchUrl(val)) return error.BadValue;
         e.search_url = try arena.dupe(u8, val);
+    } else if (std.mem.eql(u8, key, "allow_rule") or std.mem.eql(u8, key, "deny_rule")) {
+        if (policy.parseRule(val) == null) return error.BadValue;
+        const slot = if (std.mem.eql(u8, key, "allow_rule")) &e.allow_rules else &e.deny_rules;
+        var list: std.ArrayList([]const u8) = .empty;
+        if (slot.*) |old| try list.appendSlice(arena, old);
+        try list.append(arena, try arena.dupe(u8, val));
+        slot.* = try list.toOwnedSlice(arena);
+    } else if (std.mem.eql(u8, key, "rules") and std.mem.eql(u8, val, "clear")) {
+        e.allow_rules = null;
+        e.deny_rules = null;
     } else if (std.mem.eql(u8, key, "root")) {
         if (std.mem.eql(u8, val, "true")) e.allow_root = true else if (std.mem.eql(u8, val, "false")) e.allow_root = false else return error.BadValue;
     } else return error.UnknownKey;
@@ -296,4 +315,22 @@ test "new settings: shell, web, subagents, plan, search_url" {
     try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "web=maybe"));
     try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "search_url=http://insecure/?q={q}"));
     try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "search_url=https://no-placeholder.example/"));
+}
+
+test "rules in settings: add, validate, round trip, clear" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var e: Entry = .{ .backend = .ollama, .id = "m" };
+    try setKey(a.allocator(), &e, "allow_rule=run_command(git status*)");
+    try setKey(a.allocator(), &e, "allow_rule=edit_file(/w/*)");
+    try setKey(a.allocator(), &e, "deny_rule=*(*.pem)");
+    try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "allow_rule=nonsense"));
+    const text = try serialize(a.allocator(), &.{e});
+    const back = try parse(a.allocator(), std.testing.allocator, text);
+    const s = apply(.{ .level = .ask }, back[0]);
+    try std.testing.expectEqual(@as(usize, 2), s.allow_rules.len);
+    try std.testing.expectEqual(@as(usize, 1), s.deny_rules.len);
+    try std.testing.expectError(error.InvalidEntry, parse(a.allocator(), std.testing.allocator, "[[agent]]\nbackend=\"ollama\"\nid=\"m\"\nallow_rules=[\"bad rule\"]\n"));
+    try setKey(a.allocator(), &e, "rules=clear");
+    try std.testing.expect(e.allow_rules == null and e.deny_rules == null);
 }
