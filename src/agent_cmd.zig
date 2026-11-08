@@ -25,6 +25,8 @@ pub const usage =
     \\  aimgr agent settings                        all stored per-model settings
     \\  aimgr agent set <ollama|llama> <model> key=value...
     \\        keys: level=  dirs=/a,/b  steps=N  timeout=S  output_kb=N  allow=cmd,cmd  sandbox=  root=true|false
+    \\              shell=none|bash|sh|dksh (run_shell, level ask only)  web=true|false  subagents=true|false
+    \\              plan=true|false (start in plan mode)  search_url=https://host/?q={q}  (enables web_search)
     \\  aimgr agent reset <ollama|llama> <model>    forget a model's stored settings
     \\
     \\levels:  off        chat only
@@ -72,6 +74,14 @@ fn printSettings(out: *std.Io.Writer, s: policy.Settings) !void {
     try out.print("  level:          {s}\n  directories:    ", .{s.level.text()});
     if (s.dirs.len == 0) try out.writeAll("(none yet)") else for (s.dirs, 0..) |d, i| try out.print("{s}{s}", .{ if (i > 0) ", " else "", d });
     try out.print("\n  max steps:      {d} per request\n  command timeout: {d} s\n  output cap:     {d} KiB\n  sandbox:        {s}\n  root commands:  {s}\n", .{ s.max_steps, s.timeout_s, s.max_output_kb, @tagName(s.sandbox), if (s.allow_root) "may be requested (always asks)" else "denied" });
+    try out.print("  shell:          {s}{s}\n  web tools:      {s}{s}\n  sub-agents:     {s}\n  plan mode:      {s}\n", .{
+        policy.effectiveShell(s).text(),
+        if (s.level != .ask) " (run_shell needs level 'ask')" else "",
+        if (s.web) "on (each request asks)" else "off",
+        if (s.web and s.search_url != null) ", web_search configured" else if (s.web) ", no search endpoint (web_search off)" else "",
+        if (s.subagents) "on" else "off",
+        if (s.plan) "sessions start in plan mode" else "off (use /plan in a session)",
+    });
     if (s.allow_commands.len > 0) {
         try out.writeAll("  extra read-only commands: ");
         for (s.allow_commands, 0..) |c, i| try out.print("{s}{s}", .{ if (i > 0) ", " else "", c });
@@ -123,7 +133,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         for (args[3..]) |kv| {
             settings.setKey(arena, &e, kv) catch |er| {
                 try err.print("aimgr: '{s}': {s}\n", .{ kv, switch (er) {
-                    error.UnknownKey => "unknown key (level, dirs, steps, timeout, output_kb, allow, sandbox, root)",
+                    error.UnknownKey => "unknown key (level, dirs, steps, timeout, output_kb, allow, sandbox, root, shell, web, subagents, plan, search_url)",
                     error.BadValue => "invalid value",
                     error.OutOfMemory => "out of memory",
                 } });
@@ -239,7 +249,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     var input: run.Input = undefined;
     input.init(io);
     const audit = try config.statePath(arena, env, "agent-audit.log");
-    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434" };
+    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env) };
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
     if (kind == .ollama) return run.session(renv, id, eff.s, sandbox_on);
@@ -265,6 +275,14 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     renv.api = .openai;
     renv.host_port = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{srv.port});
     return run.session(renv, id, eff.s, sandbox_on);
+}
+
+/// ~/.config/aimgr/skills if it exists (user-written *.md instruction files for load_skill).
+fn skillsDir(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ?[]const u8 {
+    const dir = (config.configPath(arena, env, "skills") catch return null) orelse return null;
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{}) catch return null;
+    d.close(io);
+    return dir;
 }
 
 fn inventoryHas(report: inventory.Inventory, kind: backend.Kind, id: []const u8) bool {

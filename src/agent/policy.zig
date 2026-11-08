@@ -47,6 +47,21 @@ pub const Sandbox = enum {
     }
 };
 
+pub const Shell = enum {
+    none,
+    bash,
+    sh,
+    dksh,
+
+    pub fn text(self: Shell) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(s: []const u8) ?Shell {
+        return std.meta.stringToEnum(Shell, s);
+    }
+};
+
 pub const Settings = struct {
     level: Level = .read_only,
     /// Absolute, normalized directories the model may work in.
@@ -59,7 +74,23 @@ pub const Settings = struct {
     sandbox: Sandbox = .auto,
     /// Whether root escalation may even be *requested* (still approval-gated).
     allow_root: bool = false,
+    /// Which shell run_shell uses; null = default (bash at level `ask`, otherwise none).
+    shell: ?Shell = null,
+    /// web_fetch / web_search tools (every request is still approval-gated).
+    web: bool = false,
+    /// spawn_agent tool (sub-agents never have more autonomy than their parent).
+    subagents: bool = true,
+    /// Start every session in plan mode (read tools + submit_plan until the user approves).
+    plan: bool = false,
+    /// JSON search endpoint template containing "{q}" for web_search; null = web_search is not offered.
+    search_url: ?[]const u8 = null,
 };
+
+/// The shell run_shell would use: only at level `ask`, bash unless configured otherwise.
+pub fn effectiveShell(s: Settings) Shell {
+    if (s.level != .ask) return .none;
+    return s.shell orelse .bash;
+}
 
 /// Default autonomy from what the model can do. Small models are unreliable at tool use, so they get
 /// the narrowest level; every default can be overridden per model.
@@ -492,4 +523,14 @@ test "sensitive names" {
     try std.testing.expect(looksSensitive("/x/.env.production"));
     try std.testing.expect(looksSensitive("/x/ID_RSA"));
     try std.testing.expect(!looksSensitive("/stuff/Books/Animals/environment.txt"));
+}
+
+test "shell availability follows the level" {
+    try std.testing.expectEqual(Shell.none, effectiveShell(.{ .level = .inspect }));
+    try std.testing.expectEqual(Shell.bash, effectiveShell(.{ .level = .ask }));
+    try std.testing.expectEqual(Shell.dksh, effectiveShell(.{ .level = .ask, .shell = .dksh }));
+    try std.testing.expectEqual(Shell.none, effectiveShell(.{ .level = .ask, .shell = .none }));
+    try std.testing.expectEqual(Shell.none, effectiveShell(.{ .level = .read_only, .shell = .bash })); // setting cannot raise the level's reach
+    try std.testing.expectEqual(@as(?Shell, .sh), Shell.parse("sh"));
+    try std.testing.expectEqual(@as(?Shell, null), Shell.parse("zsh"));
 }

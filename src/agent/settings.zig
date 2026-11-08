@@ -11,6 +11,11 @@
 //!   allow_commands = ["md5sum"]    # extra read-only commands (names only)
 //!   sandbox = "auto"               # auto | bwrap | none
 //!   allow_root = false
+//!   shell = "bash"                 # none | bash | sh | dksh (only used at level ask)
+//!   web = false                    # web_fetch / web_search tools (each request asks)
+//!   subagents = true
+//!   plan = false                   # start sessions in plan mode
+//!   search_url = "https://search.example/?q={q}&format=json"
 //!
 //! Every field is optional; a missing field falls back to the default derived from what the model can do.
 const std = @import("std");
@@ -29,6 +34,11 @@ pub const Entry = struct {
     allow_commands: ?[]const []const u8 = null,
     sandbox: ?policy.Sandbox = null,
     allow_root: ?bool = null,
+    shell: ?policy.Shell = null,
+    web: ?bool = null,
+    subagents: ?bool = null,
+    plan: ?bool = null,
+    search_url: ?[]const u8 = null,
 };
 
 pub const Error = error{ InvalidEntry, OutOfMemory };
@@ -45,6 +55,11 @@ pub fn apply(base: policy.Settings, e: ?Entry) policy.Settings {
     if (ent.allow_commands) |v| s.allow_commands = v;
     if (ent.sandbox) |v| s.sandbox = v;
     if (ent.allow_root) |v| s.allow_root = v;
+    if (ent.shell) |v| s.shell = v;
+    if (ent.web) |v| s.web = v;
+    if (ent.subagents) |v| s.subagents = v;
+    if (ent.plan) |v| s.plan = v;
+    if (ent.search_url) |v| s.search_url = v;
     return s;
 }
 
@@ -100,6 +115,14 @@ pub fn parse(arena: std.mem.Allocator, gpa: std.mem.Allocator, text: []const u8)
         e.timeout_s = try intOpt(t, "timeout_s", 1, 600);
         e.max_output_kb = try intOpt(t, "max_output_kb", 1, 4096);
         e.allow_root = t.getBool("allow_root");
+        if (t.getString("shell")) |sh| e.shell = policy.Shell.parse(sh) orelse return error.InvalidEntry;
+        e.web = t.getBool("web");
+        e.subagents = t.getBool("subagents");
+        e.plan = t.getBool("plan");
+        if (t.getString("search_url")) |su| {
+            if (!validSearchUrl(su)) return error.InvalidEntry;
+            e.search_url = try arena.dupe(u8, su);
+        }
         try out.append(arena, e);
     }
     return try out.toOwnedSlice(arena);
@@ -140,8 +163,25 @@ pub fn serialize(arena: std.mem.Allocator, entries: []const Entry) ![]u8 {
         if (e.allow_commands) |v| try writeList(w, "allow_commands", v);
         if (e.sandbox) |v| try w.print("sandbox = \"{s}\"\n", .{@tagName(v)});
         if (e.allow_root) |v| try w.print("allow_root = {s}\n", .{if (v) "true" else "false"});
+        if (e.shell) |v| try w.print("shell = \"{s}\"\n", .{v.text()});
+        if (e.web) |v| try w.print("web = {s}\n", .{if (v) "true" else "false"});
+        if (e.subagents) |v| try w.print("subagents = {s}\n", .{if (v) "true" else "false"});
+        if (e.plan) |v| try w.print("plan = {s}\n", .{if (v) "true" else "false"});
+        if (e.search_url) |v| {
+            try w.writeAll("search_url = ");
+            try quote(w, v);
+            try w.writeByte('\n');
+        }
     }
     return aw.toOwnedSlice();
+}
+
+/// https only, must contain the {q} placeholder, no whitespace or control characters.
+pub fn validSearchUrl(u: []const u8) bool {
+    if (!std.mem.startsWith(u8, u, "https://") or u.len > 500) return false;
+    if (std.mem.indexOf(u8, u, "{q}") == null) return false;
+    for (u) |c| if (c <= 0x20 or c == 0x7f) return false;
+    return true;
 }
 
 pub const SetError = error{ UnknownKey, BadValue, OutOfMemory };
@@ -183,6 +223,14 @@ pub fn setKey(arena: std.mem.Allocator, e: *Entry, kv: []const u8) SetError!void
         e.allow_commands = try out.toOwnedSlice(arena);
     } else if (std.mem.eql(u8, key, "sandbox")) {
         e.sandbox = policy.Sandbox.parse(val) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "shell")) {
+        e.shell = policy.Shell.parse(val) orelse return error.BadValue;
+    } else if (std.mem.eql(u8, key, "web") or std.mem.eql(u8, key, "subagents") or std.mem.eql(u8, key, "plan")) {
+        const b = if (std.mem.eql(u8, val, "true")) true else if (std.mem.eql(u8, val, "false")) false else return error.BadValue;
+        if (std.mem.eql(u8, key, "web")) e.web = b else if (std.mem.eql(u8, key, "subagents")) e.subagents = b else e.plan = b;
+    } else if (std.mem.eql(u8, key, "search_url")) {
+        if (!validSearchUrl(val)) return error.BadValue;
+        e.search_url = try arena.dupe(u8, val);
     } else if (std.mem.eql(u8, key, "root")) {
         if (std.mem.eql(u8, val, "true")) e.allow_root = true else if (std.mem.eql(u8, val, "false")) e.allow_root = false else return error.BadValue;
     } else return error.UnknownKey;
@@ -227,4 +275,25 @@ test "invalid entries are rejected" {
     try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "dirs=relative/path"));
     try std.testing.expectError(error.UnknownKey, setKey(a.allocator(), &e, "sudo=yes"));
     try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "allow=/bin/rm"));
+}
+
+test "new settings: shell, web, subagents, plan, search_url" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    var e: Entry = .{ .backend = .llama, .id = "o/m:Q4" };
+    try setKey(a.allocator(), &e, "shell=dksh");
+    try setKey(a.allocator(), &e, "web=true");
+    try setKey(a.allocator(), &e, "subagents=false");
+    try setKey(a.allocator(), &e, "plan=true");
+    try setKey(a.allocator(), &e, "search_url=https://s.example/search?q={q}&format=json");
+    const text = try serialize(a.allocator(), &.{e});
+    const back = try parse(a.allocator(), std.testing.allocator, text);
+    const s = apply(.{ .level = .ask }, back[0]);
+    try std.testing.expectEqual(policy.Shell.dksh, s.shell.?);
+    try std.testing.expect(s.web and !s.subagents and s.plan);
+    try std.testing.expect(std.mem.indexOf(u8, s.search_url.?, "{q}") != null);
+    try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "shell=zsh"));
+    try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "web=maybe"));
+    try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "search_url=http://insecure/?q={q}"));
+    try std.testing.expectError(error.BadValue, setKey(a.allocator(), &e, "search_url=https://no-placeholder.example/"));
 }
