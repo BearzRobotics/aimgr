@@ -31,6 +31,13 @@ pub fn readProc(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usi
 }
 
 pub fn isListening(gpa: std.mem.Allocator, io: std.Io, port: u16) bool {
+    if (@import("builtin").os.tag == .windows) {
+        // No /proc: try to connect to the loopback port.
+        const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return false;
+        var stream = addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } } }) catch return false;
+        stream.close(io);
+        return true;
+    }
     for ([_][]const u8{ "/proc/net/tcp", "/proc/net/tcp6" }) |path| {
         const text = readProc(gpa, io, path, 8 << 20) catch continue;
         defer gpa.free(text);

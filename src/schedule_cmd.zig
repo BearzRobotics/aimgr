@@ -124,6 +124,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
 
     if (std.mem.eql(u8, sub, "install") or std.mem.eql(u8, sub, "uninstall")) return installUnits(arena, io, env, out, err, std.mem.eql(u8, sub, "install"), args[1..]);
 
+    if (@import("builtin").os.tag == .windows and (std.mem.eql(u8, sub, "run") or std.mem.eql(u8, sub, "run-due") or std.mem.eql(u8, sub, "install"))) return fail(err, "scheduled agent runs are not available on Windows yet");
     if (std.mem.eql(u8, sub, "run") or std.mem.eql(u8, sub, "run-due")) {
         const lock = try acquireLock(arena, gpa, io, env, out);
         if (!lock) return 0;

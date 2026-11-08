@@ -150,6 +150,11 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         return 0;
     }
 
+    if (@import("builtin").os.tag == .windows) {
+        try err.writeAll("aimgr: agent mode is not available on Windows yet (it needs a sandbox and POSIX path rules). Everything else works.\n");
+        return 1;
+    }
+
     // ---- run a session ----
     if (args.len < 2) return fail(err, usage);
     const kind = std.meta.stringToEnum(backend.Kind, args[0]) orelse return fail(err, usage);
