@@ -39,10 +39,15 @@ fn splitColumns(line: []const u8, out: [][]const u8) usize {
 }
 
 pub fn parseVersion(text: []const u8) ?[]const u8 {
-    const prefix = "ollama version is ";
-    const t = std.mem.trim(u8, text, " \r\n");
-    if (!std.mem.startsWith(u8, t, prefix)) return null;
-    return t[prefix.len..];
+    // "ollama version is X" (daemon running), or "Warning: client version is X" (no daemon; also on stderr).
+    var it = std.mem.tokenizeAny(u8, text, "\r\n");
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " ");
+        for ([_][]const u8{ "ollama version is ", "Warning: client version is ", "client version is " }) |prefix| {
+            if (std.mem.startsWith(u8, t, prefix)) return std.mem.trim(u8, t[prefix.len..], " ");
+        }
+    }
+    return null;
 }
 
 /// Parse `ollama list` output. Fails with UnsupportedFormat on header/shape mismatch.
@@ -78,7 +83,7 @@ pub fn probe(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io) backe
         .exited => |c| if (c != 0) return .{ .failed = "ollama --version exited non-zero" },
         else => return .{ .failed = "ollama --version could not run" },
     }
-    const v = parseVersion(r.stdout) orelse return .{ .failed = "unrecognized ollama --version output" };
+    const v = parseVersion(r.stdout) orelse parseVersion(r.stderr) orelse return .{ .failed = "unrecognized ollama --version output" };
     return .{ .available = arena.dupe(u8, v) catch return .{ .failed = "out of memory" } };
 }
 
@@ -91,6 +96,12 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io) backen
         else => return error.BackendFailed,
     }
     return parseList(arena, r.stdout);
+}
+
+test "parseVersion client warning" {
+    try std.testing.expectEqualStrings("0.40.15", parseVersion("Warning: could not connect to a running Ollama instance\nWarning: client version is 0.40.15\n").?);
+    try std.testing.expectEqualStrings("0.5.1", parseVersion("ollama version is 0.5.1\n").?);
+    try std.testing.expect(parseVersion("nonsense") == null);
 }
 
 test "parse empty list (real capture)" {

@@ -18,6 +18,7 @@ const win = if (is_windows) struct {
     extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) c_int;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) c_uint;
     extern "kernel32" fn GetProcessId(h: HANDLE) callconv(.winapi) c_uint;
+    extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: [*:0]const u16) callconv(.winapi) c_int;
     extern "kernel32" fn SetConsoleCtrlHandler(cb: ?*const fn (c_uint) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
 } else struct {};
 
@@ -104,4 +105,16 @@ pub fn resetInterrupt() void {
     const act: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
     std.posix.sigaction(.INT, &act, null);
     std.posix.sigaction(.TERM, &act, null);
+}
+
+/// Windows: put `dir` first on this process's PATH (and in `env`, which spawned children inherit), so tools
+/// installed by `aimgr setup-backends` are found by name. No-op elsewhere.
+pub fn prependPath(arena: std.mem.Allocator, env: *std.process.Environ.Map, dir: []const u8) void {
+    if (!is_windows) return;
+    const old = env.get("PATH") orelse env.get("Path") orelse "";
+    const joined = std.fmt.allocPrint(arena, "{s};{s}", .{ dir, old }) catch return;
+    env.put("PATH", joined) catch {};
+    const k = std.unicode.utf8ToUtf16LeAllocZ(arena, "PATH") catch return;
+    const v = std.unicode.utf8ToUtf16LeAllocZ(arena, joined) catch return;
+    _ = win.SetEnvironmentVariableW(k, v);
 }

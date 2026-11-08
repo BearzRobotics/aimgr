@@ -10,6 +10,7 @@ const usage =
     \\commands:
     \\  tui      interactive interface (default when run in a terminal)
     \\  agent    let a tool-capable model inspect files / run commands under guardrails: agent <ollama> <model> --dir DIR | show | set | settings | reset
+    \\  setup-backends  Windows only: download Ollama (checked, asks first): setup-backends [--yes] [--dry-run]
     \\  schedule saved agent tasks that run unattended (read-only/inspect only): schedule add|list|run|run-due|results|install ...
     \\  sources  manage where models are discovered: sources [list] | add <kind> <id> [<location>] | enable|disable|remove <id> | refresh [<id>]
     \\  search   search Hugging Face for GGUF models (network, only when you run it): search <text> [--limit N]
@@ -43,6 +44,13 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
+    if (@import("builtin").os.tag == .windows) {
+        // Ollama installed by `aimgr setup-backends` lives in aimgr's data folder.
+        if (aimgr.setup_backends.ollamaDir(arena, init.environ_map) catch null) |d| {
+            const exe = std.fs.path.join(arena, &.{ d, "ollama.exe" }) catch "";
+            if (std.Io.Dir.cwd().access(io, exe, .{})) |_| aimgr.platform.prependPath(arena, init.environ_map, d) else |_| {}
+        }
+    }
 
     var out_buf: [4096]u8 = undefined;
     var out_w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
@@ -69,6 +77,8 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (std.mem.eql(u8, cmd, "agent")) {
         const report = inv.discover(arena, init.gpa, io);
         code = try aimgr.agent_cmd.main(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "setup-backends")) {
+        code = try aimgr.setup_backends.main(arena, init.gpa, io, init.environ_map, out, err, args[2..]);
     } else if (std.mem.eql(u8, cmd, "schedule")) {
         const report = inv.discover(arena, init.gpa, io);
         code = try aimgr.schedule_cmd.main(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
