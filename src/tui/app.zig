@@ -47,6 +47,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map
         .io = io,
         .environ = environ,
         .data = std.heap.ArenaAllocator.init(gpa),
+        .data_prev = std.heap.ArenaAllocator.init(gpa),
         .frame = std.heap.ArenaAllocator.init(gpa),
         .online_arena = std.heap.ArenaAllocator.init(gpa),
         .jobs = .{ .gpa = gpa, .io = io },
@@ -55,6 +56,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map
     };
     defer {
         app.data.deinit();
+        app.data_prev.deinit();
         app.frame.deinit();
         app.online_arena.deinit();
         app.filter.deinit(gpa);
@@ -100,7 +102,8 @@ fn noteFinished(app: *App) void {
 
 /// Rebuild inventory, catalog and rows. Existing selections are clamped by draw.
 pub fn refresh(app: *App) void {
-    app.data.deinit();
+    app.data_prev.deinit(); // two generations back: nothing may still point into it
+    app.data_prev = app.data;
     app.data = std.heap.ArenaAllocator.init(app.gpa);
     const a = app.data.allocator();
     app.report = inventory.discover(a, app.gpa, app.io);

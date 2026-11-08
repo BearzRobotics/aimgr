@@ -36,6 +36,9 @@ pub const App = struct {
 
     /// Rebuilt on refresh: report, catalog, rows live here.
     data: std.heap.ArenaAllocator,
+    /// The previous generation of `data`, kept alive for one more refresh. A reference taken before
+    /// a refresh therefore stays valid memory instead of crashing the UI if some code reads it late.
+    data_prev: std.heap.ArenaAllocator,
     /// Reset every frame.
     frame: std.heap.ArenaAllocator,
     report: inventory.Inventory = undefined,
