@@ -2,6 +2,7 @@
 //! (policy.zig does) but enforce hard limits: output size, file size, timeouts, symlink-safe paths.
 const std = @import("std");
 const policy = @import("policy.zig");
+const pkghint = @import("pkghint.zig");
 const process = @import("process_shim.zig");
 
 pub const Tool = enum { list_dir, read_file, search_files, find_files, ask_user, update_todos, load_skill, run_command, run_shell, write_file, edit_file, move_file, make_dir, delete_file, submit_plan, spawn_agent, web_fetch, web_search, notify, edit_notebook_cell, run_background, check_background, stop_background, enter_worktree, exit_worktree };
@@ -267,22 +268,78 @@ pub fn readFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, offset: 
     return out.toOwnedSlice(arena);
 }
 
-/// Text of a PDF via `pdftotext` (poppler) when it is installed; null = not available (caller shows "binary").
-/// `offset`/`limit` apply to the extracted text, so long books can be read in parts.
+/// Text of a PDF via `pdftotext` (poppler). A scanned PDF (no text layer) is OCRed with `tesseract` when it is
+/// installed (first pages only, it is slow). When a needed tool is missing, the text says which package to
+/// install, so the model can tell the user. `offset`/`limit` apply to the extracted text.
 fn pdfText(arena: std.mem.Allocator, io: std.Io, path: []const u8, offset: u64, limit: u64) !?[]const u8 {
     const r = process.run(arena, io, &.{ "pdftotext", "-q", "-layout", path, "-" }, 60, null, 64 * 1024 * 1024);
     switch (r.outcome) {
         .exited => |c| if (c != 0) return null,
+        .not_found => return try std.fmt.allocPrint(arena, "[cannot read PDF text] {s}", .{try pkghint.advice(arena, io, .pdftotext)}),
         else => return null,
     }
-    const text = r.stdout;
-    if (std.mem.trim(u8, text, " \t\r\n\x0c").len == 0) return try arena.dupe(u8, "[this PDF has no text layer: it is scanned page images, so there is no text to read (OCR would be needed)]");
+    var text: []const u8 = r.stdout;
+    var source: []const u8 = "pdftotext";
+    if (std.mem.trim(u8, text, " \t\r\n\x0c").len == 0) {
+        const ocr = try ocrPdf(arena, io, path, ocr_pages);
+        switch (ocr) {
+            .text => |t| {
+                text = t;
+                source = "OCR (tesseract) of the first pages; scanned book, so expect recognition errors";
+            },
+            .missing => return try std.fmt.allocPrint(arena, "[this PDF is scanned page images with no text layer; reading it needs OCR] {s}", .{try pkghint.advice(arena, io, .tesseract)}),
+            .failed => |why| return try std.fmt.allocPrint(arena, "[this PDF is scanned page images; OCR failed: {s}]", .{why}),
+        }
+    }
     if (offset >= text.len) return try std.fmt.allocPrint(arena, "[offset {d} is past the end of the extracted text ({d} bytes)]", .{ offset, text.len });
     const end: usize = @intCast(@min(text.len, offset + limit));
     var out: std.ArrayList(u8) = .empty;
-    try out.print(arena, "[text extracted from PDF with pdftotext]\n{s}", .{text[@intCast(offset)..end]});
+    try out.print(arena, "[text extracted from PDF with {s}]\n{s}", .{ source, text[@intCast(offset)..end] });
     if (end < text.len) try out.print(arena, "\n[... text continues: {d} of {d} bytes shown; call read_file again with offset={d} ...]", .{ end, text.len, end });
     return try out.toOwnedSlice(arena);
+}
+
+const ocr_pages = 8;
+
+const Ocr = union(enum) { text: []const u8, missing, failed: []const u8 };
+
+/// Render pages 1..n to images with pdftoppm (poppler) and recognise them with tesseract, in a private temp dir.
+fn ocrPdf(arena: std.mem.Allocator, io: std.Io, path: []const u8, n: u32) !Ocr {
+    const probe = process.run(arena, io, &.{ "tesseract", "--version" }, 10, null, 64 * 1024);
+    if (probe.outcome == .not_found) return .missing;
+    const tmp_base = if (policy.is_windows) "C:/Windows/Temp" else "/tmp";
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const dir = try std.fmt.allocPrint(arena, "{s}/aimgr-ocr-{x}", .{ tmp_base, rnd });
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return .{ .failed = "cannot create a temporary folder" };
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const prefix = try std.fmt.allocPrint(arena, "{s}/p", .{dir});
+    const last = try std.fmt.allocPrint(arena, "{d}", .{n});
+    const ras = process.run(arena, io, &.{ "pdftoppm", "-q", "-r", "200", "-gray", "-png", "-f", "1", "-l", last, path, prefix }, 180, null, 64 * 1024);
+    switch (ras.outcome) {
+        .exited => |c| if (c != 0) return .{ .failed = "pdftoppm could not render the pages" },
+        .not_found => return .{ .failed = "pdftoppm (poppler) is not installed" },
+        else => return .{ .failed = "pdftoppm did not finish" },
+    }
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return .{ .failed = "temporary folder vanished" };
+    defer d.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = d.iterate();
+    while (it.next(io) catch null) |en| if (std.mem.endsWith(u8, en.name, ".png")) try names.append(arena, try arena.dupe(u8, en.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    for (names.items, 1..) |name, page| {
+        const img = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
+        const t = process.run(arena, io, &.{ "tesseract", img, "-", "--psm", "3" }, 120, null, 4 * 1024 * 1024);
+        if (t.outcome != .exited) continue;
+        try out.print(arena, "\n--- page {d} ---\n{s}", .{ page, t.stdout });
+    }
+    if (std.mem.trim(u8, out.items, " \n\r\t-0123456789page").len == 0) return .{ .failed = "no text was recognised" };
+    return .{ .text = out.items };
 }
 
 pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {

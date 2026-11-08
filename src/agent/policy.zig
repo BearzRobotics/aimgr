@@ -363,11 +363,12 @@ const interpreters = [_][]const u8{ "python", "python3", "perl", "ruby", "node",
 /// Obviously destructive or system-changing: approval-gated with a stronger reason.
 const destructive = [_][]const u8{ "rm", "rmdir", "mv", "cp", "dd", "shred", "truncate", "chmod", "chown", "chgrp", "ln", "mkfs", "fdisk", "parted", "mount", "umount", "kill", "killall", "pkill", "systemctl", "service", "reboot", "shutdown", "poweroff", "apt", "apt-get", "dpkg", "snap", "pip", "pip3", "npm", "useradd", "userdel", "passwd", "crontab", "iptables", "ufw", "modprobe", "insmod", "rmmod", "mkdir", "touch", "tee", "install" };
 /// Commands that only read and print (further checked for flags and path arguments).
-const read_only_cmds = [_][]const u8{ "ls", "cat", "head", "tail", "grep", "find", "wc", "file", "stat", "du", "df", "pwd", "tree", "basename", "dirname", "realpath", "readlink", "date", "uname", "whoami", "id", "hostname", "which", "nproc", "uptime", "free", "lsblk",
+const read_only_cmds = [_][]const u8{
+    "ls",    "cat",   "head",  "tail",   "grep", "find", "wc", "file", "stat", "du",      "df",     "pwd",  "tree", "basename", "dirname", "realpath", "readlink", "date", "uname",  "whoami",  "id",        "hostname",  "which", "nproc", "uptime",    "free",    "lsblk",
     // text tools (no file output unless noted; those are checked in readOnlyArgsOk)
-    "sort", "uniq", "cut", "diff", "cmp", "comm", "nl", "tac", "rev", "strings", "column", "fold", "fmt", "expand", "jq", "echo", "printf", "seq",
-    "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum",
-    "pdftotext", "pdfinfo", "ps", "lscpu", "lspci", "lsusb", "locale" };
+    "sort",  "uniq",  "cut",   "diff",   "cmp",  "comm", "nl", "tac",  "rev",  "strings", "column", "fold", "fmt",  "expand",   "jq",      "echo",     "printf",   "seq",  "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "pdftotext", "pdfinfo", "ps",
+    "lscpu", "lspci", "lsusb", "locale",
+};
 const windows_read_only_cmds = [_][]const u8{ "where", "hostname", "whoami", "tasklist", "findstr", "fc", "systeminfo", "pdftotext", "pdfinfo", "jq" };
 const git_ok_sub = [_][]const u8{ "status", "log", "diff", "show", "branch", "ls-files", "rev-parse", "remote", "shortlog", "describe" };
 const find_bad_flags = [_][]const u8{ "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls" };

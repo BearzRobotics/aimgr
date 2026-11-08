@@ -204,6 +204,47 @@ fn printReply(e: Env, ta: std.mem.Allocator, indent: []const u8, text: []const u
     try e.out.print("\n{s}assistant> {s}\n", .{ indent, text });
 }
 
+/// `!command`: the USER runs a command in their own shell, on this terminal (so sudo and installers can ask
+/// their questions). It is the user's action, not the model's: no approval, no sandbox. The model is told that
+/// it ran and how it ended, so it can continue (for example after installing a missing package).
+fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(chat.Msg), command: []const u8) !void {
+    if (command.len == 0) {
+        try e.out.writeAll("usage: !COMMAND   (runs in your shell, in the first folder)\n");
+        return;
+    }
+    const sh: policy.Shell = if (s.shell) |x| (if (x == .none) (if (policy.is_windows) .powershell else .bash) else x) else (if (policy.is_windows) .powershell else .bash);
+    var arena_state = std.heap.ArenaAllocator.init(e.gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const shell_path = tools.findExecutable(a, e.io, sh.exeName(), e.path_env, e.home) orelse {
+        try e.out.print("cannot find {s} on PATH\n", .{sh.exeName()});
+        return;
+    };
+    const argv: []const []const u8 = switch (sh) {
+        .bash => &.{ shell_path, "-c", command }, // the user's own shell setup is fine here
+        else => try tools.shellArgv(a, sh, shell_path, command),
+    };
+    try e.out.flush();
+    var child = std.process.spawn(e.io, .{
+        .argv = argv,
+        .cwd = if (s.dirs.len > 0) .{ .path = s.dirs[0] } else .inherit,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |er| {
+        try e.out.print("could not start {s}: {s}\n", .{ sh.text(), @errorName(er) });
+        return;
+    };
+    const term = child.wait(e.io) catch null;
+    const code: i64 = if (term) |t| switch (t) {
+        .exited => |c| c,
+        else => -1,
+    } else -1;
+    try e.out.print("[exit code {d}]\n", .{code});
+    try msgs.append(ha, .{ .role = .user, .content = try std.fmt.allocPrint(ha, "(I ran this command myself in my terminal: `{s}`; it exited with code {d}. Its output was shown to me, not to you.)", .{ command, code }) });
+    try msgs.append(ha, .{ .role = .assistant, .content = "Noted." });
+}
+
 fn modeText(st: *const State) []const u8 {
     return if (st.plan_mode) "plan" else if (st.auto_edits) "edits" else "default";
 }
@@ -284,6 +325,10 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
         const user = e.input.line() orelse return 0;
         if (user.len == 0) continue;
         if (std.mem.eql(u8, user, "/exit") or std.mem.eql(u8, user, "/quit")) return 0;
+        if (user[0] == '!') {
+            try bang(e, ha, s, &msgs, std.mem.trim(u8, user[1..], " "));
+            continue;
+        }
         if (std.mem.eql(u8, user, "/help")) {
             try e.out.writeAll(
                 \\  /mode [default|edits|plan]  edits = file edits in the folder are approved without asking
@@ -294,6 +339,7 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
                 \\  /status                     model, level, mode, folders, sandbox, shell, notes
                 \\  /rules                      your allow/deny rules and this session's 'always' answers
                 \\  /todos                      the model's task list
+                \\  !COMMAND                    run a command yourself in your shell (e.g. !sudo apt install tesseract-ocr)
                 \\  /exit                       end the session
                 \\At an approval: y = yes, a = always (this session), anything else = no.
                 \\Project notes: put AIMGR.md (or AGENTS.md / CLAUDE.md) in the folder; it is read at start.
