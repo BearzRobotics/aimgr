@@ -1,4 +1,4 @@
-% AIMGR(1) Version 0.1.0 | aimgr Manual
+% AIMGR(1) Version 0.2.0 | aimgr Manual
 % aimgr contributors
 % 2026-11-08
 
