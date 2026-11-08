@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (std.mem.eql(u8, cmd, "hardware")) {
         const hw = try aimgr.hardware.detect(arena, init.gpa, io);
         try out.print("RAM: {d:.1} GB total, {d:.1} GB available\n", .{ aimgr.hardware.gb(hw.mem.total), aimgr.hardware.gb(hw.mem.available) });
-        if (hw.gpus.len == 0) try out.writeAll("GPU: none detected (checked nvidia-smi and /sys/class/drm)\n");
+        if (hw.gpus.len == 0) try out.writeAll("GPU: none detected\n");
         for (hw.gpus) |g| try out.print("GPU: {s} {s}: {d:.1} GB VRAM, {d:.1} GB free{s} [{s}]\n", .{ @tagName(g.vendor), g.label, aimgr.hardware.gb(g.vram_total), aimgr.hardware.gb(g.free()), if (g.integrated) " (integrated, ignored for fit)" else "", g.source });
         try out.writeAll("Fit estimates (list --fit, TUI detail) are advisory ranges at 4096 context:\n  weights from the reported size (or parameter count in the name x quantization bits),\n  plus a KV-cache range of 0.01-0.075 MiB per token per billion parameters and 0.3-0.8 GB runtime overhead.\n");
     } else if (std.mem.eql(u8, cmd, "probe") or std.mem.eql(u8, cmd, "list")) {

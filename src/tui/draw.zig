@@ -518,7 +518,7 @@ fn drawSettings(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usi
     try lines.append(a, "");
     try lines.append(a, "Hardware");
     try lines.append(a, try std.fmt.allocPrint(a, "  RAM: {d:.1} GB total, {d:.1} GB available", .{ hardware.gb(app.hw.mem.total), hardware.gb(app.hw.mem.available) }));
-    if (app.hw.gpus.len == 0) try lines.append(a, "  GPU: none detected (checked nvidia-smi and /sys/class/drm)");
+    if (app.hw.gpus.len == 0) try lines.append(a, "  GPU: none detected");
     for (app.hw.gpus) |g| {
         try lines.append(a, try std.fmt.allocPrint(a, "  GPU: {s} {s}: {d:.1} GB VRAM, {d:.1} GB free{s}", .{ @tagName(g.vendor), g.label, hardware.gb(g.vram_total), hardware.gb(g.free()), if (g.integrated) " (integrated; ignored for fit)" else "" }));
     }
