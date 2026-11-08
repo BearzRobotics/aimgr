@@ -283,7 +283,8 @@ pub fn classifyRead(s: Settings, path: []const u8) Decision {
         return if (s.level == .ask) .{ .ask = "reads a file that looks like it holds secrets" } else .{ .deny = "this file looks like it holds secrets and is not readable at this level" };
     }
     if (inside) return .auto;
-    return if (s.level == .ask) .{ .ask = "reads outside the allowed directories" } else .{ .deny = "outside the allowed directories" };
+    // Like Claude Code: outside the folders is not forbidden, it is the user's call (asked every time).
+    return .{ .ask = "reads outside the allowed directories" };
 }
 
 /// Classify writing a (normalized) path with write_file. Writes always need approval.
@@ -362,8 +363,12 @@ const interpreters = [_][]const u8{ "python", "python3", "perl", "ruby", "node",
 /// Obviously destructive or system-changing: approval-gated with a stronger reason.
 const destructive = [_][]const u8{ "rm", "rmdir", "mv", "cp", "dd", "shred", "truncate", "chmod", "chown", "chgrp", "ln", "mkfs", "fdisk", "parted", "mount", "umount", "kill", "killall", "pkill", "systemctl", "service", "reboot", "shutdown", "poweroff", "apt", "apt-get", "dpkg", "snap", "pip", "pip3", "npm", "useradd", "userdel", "passwd", "crontab", "iptables", "ufw", "modprobe", "insmod", "rmmod", "mkdir", "touch", "tee", "install" };
 /// Commands that only read and print (further checked for flags and path arguments).
-const read_only_cmds = [_][]const u8{ "ls", "cat", "head", "tail", "grep", "find", "wc", "file", "stat", "du", "df", "pwd", "tree", "basename", "dirname", "realpath", "readlink", "date", "uname", "whoami", "id", "hostname", "which", "nproc", "uptime", "free", "lsblk" };
-const windows_read_only_cmds = [_][]const u8{ "where", "hostname", "whoami", "tasklist", "ver" };
+const read_only_cmds = [_][]const u8{ "ls", "cat", "head", "tail", "grep", "find", "wc", "file", "stat", "du", "df", "pwd", "tree", "basename", "dirname", "realpath", "readlink", "date", "uname", "whoami", "id", "hostname", "which", "nproc", "uptime", "free", "lsblk",
+    // text tools (no file output unless noted; those are checked in readOnlyArgsOk)
+    "sort", "uniq", "cut", "diff", "cmp", "comm", "nl", "tac", "rev", "strings", "column", "fold", "fmt", "expand", "jq", "echo", "printf", "seq",
+    "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum",
+    "pdftotext", "pdfinfo", "ps", "lscpu", "lspci", "lsusb", "locale" };
+const windows_read_only_cmds = [_][]const u8{ "where", "hostname", "whoami", "tasklist", "findstr", "fc", "systeminfo", "pdftotext", "pdfinfo", "jq" };
 const git_ok_sub = [_][]const u8{ "status", "log", "diff", "show", "branch", "ls-files", "rev-parse", "remote", "shortlog", "describe" };
 const find_bad_flags = [_][]const u8{ "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls" };
 
@@ -435,6 +440,23 @@ fn readOnlyArgsOk(arena: std.mem.Allocator, s: Settings, name: []const u8, argv:
     if (std.mem.eql(u8, name, "which") or std.mem.eql(u8, name, "date")) {
         for (argv[1..]) |a| if (std.mem.startsWith(u8, a, "-s") or std.mem.startsWith(u8, a, "--set")) return escalate(s.level, "date -s changes the clock");
     }
+    if (std.mem.eql(u8, name, "sort")) {
+        for (argv[1..]) |a| if (std.mem.startsWith(u8, a, "-o") or std.mem.startsWith(u8, a, "--output") or std.mem.startsWith(u8, a, "--compress-program")) return escalate(s.level, "sort -o writes a file");
+    }
+    if (std.mem.eql(u8, name, "uniq")) {
+        var operands: usize = 0;
+        for (argv[1..]) |a| if (a.len == 0 or a[0] != '-') {
+            operands += 1;
+        };
+        if (operands > 1) return escalate(s.level, "uniq with a second file name writes to it");
+    }
+    if (std.mem.eql(u8, name, "pdftotext")) {
+        // pdftotext [options] IN.pdf [OUT.txt]: only "-" (standard output) as the last argument is read-only.
+        if (argv.len < 3 or !std.mem.eql(u8, argv[argv.len - 1], "-")) return escalate(s.level, "pdftotext writes a file unless the output is '-' (read_file reads PDFs directly)");
+    }
+    if (std.mem.eql(u8, name, "jq")) {
+        for (argv[1..]) |a| if (std.mem.startsWith(u8, a, "--rawfile") or std.mem.startsWith(u8, a, "--slurpfile") or std.mem.startsWith(u8, a, "-L")) return escalate(s.level, "jq option loads other files");
+    }
     // Path-like arguments must stay inside the allowed directories (resolved relative to dirs[0]).
     const base = if (s.dirs.len > 0) s.dirs[0] else "/";
     for (argv[1..]) |a| {
@@ -442,8 +464,9 @@ fn readOnlyArgsOk(arena: std.mem.Allocator, s: Settings, name: []const u8, argv:
         if (!looksLikePath(a)) continue;
         if (a[0] == '~') return escalate(s.level, "uses ~, which is not expanded and may mean a home directory");
         const norm = try normalizePath(arena, base, a);
-        if (!within(s.dirs, norm)) return escalate(s.level, "reads outside the allowed directories");
         if (looksSensitive(norm)) return escalate(s.level, "touches a file that looks like it holds secrets");
+        // Outside the folders: the user decides (asked every time), like read_file.
+        if (!within(s.dirs, norm)) return .{ .decision = .{ .ask = "reads outside the allowed directories" }, .kind = "read-only command" };
     }
     return null;
 }
@@ -568,7 +591,7 @@ test "path normalization and containment" {
 test "reads: inside is automatic, outside depends on level, secrets are never automatic" {
     const ro = testSettings(.read_only);
     try std.testing.expect(classifyRead(ro, "/stuff/Books/Animals").decisionIs(.auto));
-    try std.testing.expect(classifyRead(ro, "/etc/passwd").decisionIs(.deny));
+    try std.testing.expect(classifyRead(ro, "/etc/passwd").decisionIs(.ask));
     try std.testing.expect(classifyRead(testSettings(.ask), "/etc/passwd").decisionIs(.ask));
     try std.testing.expect(classifyRead(ro, "/stuff/Books/.env").decisionIs(.deny));
     try std.testing.expect(classifyRead(testSettings(.ask), "/stuff/Books/.ssh/id_ed25519").decisionIs(.ask));
@@ -620,16 +643,33 @@ test "outside the directory, traversal, and secrets are not automatic" {
     defer ar.deinit();
     const a = ar.allocator();
     const s = testSettings(.inspect);
-    try expectDeny(try cmd(a, s, "cat /etc/passwd"));
-    try expectDeny(try cmd(a, s, "cat ../../etc/passwd"));
-    try expectDeny(try cmd(a, s, "ls /stuff/BooksEvil"));
-    try expectDeny(try cmd(a, s, "cat /stuff/Books/../Secrets/x"));
-    try expectDeny(try cmd(a, s, "cat /stuff/Books/.env"));
-    try expectDeny(try cmd(a, s, "ls /home")); // outside the allowed directory
+    // Outside the folder is never automatic: the user is asked (at every level), like Claude Code.
+    try expectAsk(try cmd(a, s, "cat /etc/passwd"));
+    try expectAsk(try cmd(a, s, "cat ../../etc/passwd"));
+    try expectAsk(try cmd(a, s, "ls /stuff/BooksEvil"));
+    try expectAsk(try cmd(a, s, "cat /stuff/Books/../Secrets/x"));
+    try expectDeny(try cmd(a, s, "cat /stuff/Books/.env")); // secrets: denied below level ask
+    try expectAsk(try cmd(a, s, "ls /home"));
     // same requests at level ask become approvals, not silent runs
     const k = testSettings(.ask);
     try expectAsk(try cmd(a, k, "cat /etc/passwd"));
     try expectAsk(try cmd(a, k, "cat /stuff/Books/.env"));
+}
+
+test "basic text commands, and their file-writing forms" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = testSettings(.inspect);
+    try expectAuto(try cmd(a, s, "sort /stuff/Books/list.txt"));
+    try expectAuto(try cmd(a, s, "uniq -c /stuff/Books/list.txt"));
+    try expectAuto(try cmd(a, s, "sha256sum /stuff/Books/a.pdf"));
+    try expectAuto(try cmd(a, s, "pdftotext -l 2 /stuff/Books/a.pdf -"));
+    try expectAuto(try cmd(a, s, "jq .name /stuff/Books/x.json"));
+    try expectDeny(try cmd(a, s, "sort -o /stuff/Books/out /stuff/Books/in"));
+    try expectDeny(try cmd(a, s, "uniq /stuff/Books/in /stuff/Books/out"));
+    try expectDeny(try cmd(a, s, "pdftotext /stuff/Books/a.pdf /stuff/Books/a.txt"));
+    try expectDeny(try cmd(a, s, "pdftotext /stuff/Books/a.pdf"));
 }
 
 test "dangerous flags on allowlisted commands" {
@@ -691,9 +731,10 @@ test "user-extended allowlist" {
     defer ar.deinit();
     const a = ar.allocator();
     var s = testSettings(.inspect);
-    s.allow_commands = &.{"md5sum"};
-    try expectAuto(try cmd(a, s, "md5sum /stuff/Books/Arms"));
-    try expectDeny(try cmd(a, s, "md5sum /etc/hostname"));
+    try expectDeny(try cmd(a, s, "xxd /stuff/Books/Arms")); // not built in
+    s.allow_commands = &.{"xxd"};
+    try expectAuto(try cmd(a, s, "xxd /stuff/Books/Arms"));
+    try expectAsk(try cmd(a, s, "xxd /etc/hostname")); // outside: the user decides
 }
 
 test "sensitive names" {

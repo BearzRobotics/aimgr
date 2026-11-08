@@ -21,6 +21,9 @@ pub fn build(b: *std.Build) void {
     // (uucode) is vendored too and referenced by path from its build.zig.zon.
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     mod.addImport("vaxis", vaxis_dep.module("vaxis"));
+    // md-zig (BearzRobotics/md-zig v0.3.0, vendored): renders the model's Markdown replies in the terminal.
+    const md_dep = b.dependency("md", .{ .target = target, .optimize = optimize });
+    mod.addImport("md", md_dep.module("md"));
 
     const exe = b.addExecutable(.{
         .name = "aimgr",

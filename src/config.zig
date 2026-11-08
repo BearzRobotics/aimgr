@@ -19,6 +19,7 @@ fn abs(v: ?[]const u8) ?[]const u8 {
 
 fn pick(arena: std.mem.Allocator, env: *const Env, xdg: []const u8, win_var: []const u8, unix_rel: []const []const u8, sub: []const []const u8) !?[]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena); // the caller may pass a long-lived allocator; only the joined path is returned
     if (abs(env.get(xdg))) |x| {
         try parts.append(arena, x);
     } else if (builtin.os.tag == .windows and abs(env.get(win_var)) != null) {

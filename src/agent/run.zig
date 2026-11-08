@@ -25,6 +25,7 @@ fn systemPrompt(arena: std.mem.Allocator, s: policy.Settings, st: *const State) 
         \\if a tool call is denied, do not try to work around it, explain what you could not do and suggest what the user can do instead.
         \\{s}
         \\run_command takes one plain command (no pipes, redirects, wildcards or &&); run_shell, when offered, is a real shell and every use is approved by the user.
+        \\Paths outside the allowed directories are not forbidden: if the user asks about one, call the tool anyway and the user will be asked to allow it. Never refuse in advance.
         \\To change a file prefer edit_file with exact text; to find text use search_files; to find files by name use find_files; ask_user beats guessing.
         \\For multi-step work keep a short task list with update_todos. Every change is shown to the user for approval first. Keep answers short and say which files you actually read.
     , .{ role, dirs.items, s.level.text(), if (policy.is_windows) "This computer runs Windows: paths look like C:/Users/name/file (forward slashes are fine); there is no sudo; use the PowerShell-style cmdlets that run_shell offers." else "" });
@@ -108,7 +109,7 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
         try msgs.append(ha, .{ .role = .assistant, .content = content, .calls = try kept_calls.toOwnedSlice(ha) });
         if (content.len > 0) last = content;
 
-        if (reply.content.len > 0) try e.out.print("\n{s}assistant> {s}\n", .{ indent, reply.content });
+        if (reply.content.len > 0) try printReply(e, ta, indent, reply.content);
         if (reply.calls.len == 0) {
             if (looksLikeTextToolCall(reply.content)) try e.out.writeAll("\n  note: that reply describes a tool call as plain text instead of using the tool interface, so NOTHING was run. This model is unreliable at tool use; try one tagged [tools] that handles it well (for example gpt-oss).\n");
             return last;
@@ -142,6 +143,10 @@ pub fn subAgent(e: Env, parent: *State, ps: policy.Settings, sandbox_on: bool, t
     s.shell = .none;
     s.plan = false;
     var st: State = .{ .depth = 1, .actor = "sub-agent", .audit = parent.audit, .skills_dir = parent.skills_dir };
+    defer {
+        for (st.session_allow.items) |k| e.gpa.free(k);
+        st.session_allow.deinit(e.gpa);
+    }
     var msgs: std.ArrayList(chat.Msg) = .empty;
     try msgs.append(ha, .{ .role = .system, .content = try systemPrompt(ha, s, &st) });
     try msgs.append(ha, .{ .role = .user, .content = try ha.dupe(u8, task) });
@@ -181,8 +186,54 @@ pub fn runOnce(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool,
     return if (res) |text| try out.dupe(u8, text) else null;
 }
 
+/// The model's reply: formatted Markdown on a terminal (md-zig), plain text otherwise or if it does not parse.
+fn printReply(e: Env, ta: std.mem.Allocator, indent: []const u8, text: []const u8) !void {
+    if (e.markdown and indent.len == 0) {
+        const md = @import("md");
+        if (md.Document.parse(e.gpa, text, .{ .extensions = md.Extensions.gfm })) |doc_c| {
+            var doc = doc_c;
+            defer doc.deinit();
+            if (doc.toTextAlloc(e.gpa, .{ .width = e.width, .color = e.color, .unicode = true })) |rendered| {
+                defer e.gpa.free(rendered);
+                try e.out.print("\n{s}{s}\n", .{ if (e.color) "\x1b[1;36m●\x1b[0m " else "* ", std.mem.trim(u8, rendered, "\n") });
+                return;
+            } else |_| {}
+        } else |_| {}
+    }
+    _ = ta;
+    try e.out.print("\n{s}assistant> {s}\n", .{ indent, text });
+}
+
+fn modeText(st: *const State) []const u8 {
+    return if (st.plan_mode) "plan" else if (st.auto_edits) "edits" else "default";
+}
+
+/// Ask the model (without tools) for a summary and keep only that, so a long session fits the context again.
+fn compact(e: Env, ha: std.mem.Allocator, turn: *std.heap.ArenaAllocator, msgs: *std.ArrayList(chat.Msg)) !void {
+    if (msgs.items.len <= 2) {
+        try e.out.writeAll("nothing to compact\n");
+        return;
+    }
+    _ = turn.reset(.retain_capacity);
+    const ta = turn.allocator();
+    var req: std.ArrayList(chat.Msg) = .empty;
+    try req.appendSlice(ta, msgs.items);
+    try req.append(ta, .{ .role = .user, .content = "Summarize this conversation for yourself so you can continue the work: the user's goals, what was found (files, facts), what was changed, and what is still open. Plain text, at most 300 words. Do not call tools." });
+    const body = try chat.requestBody(ta, e.api, e.model, req.items, "[]", 8192);
+    const reply = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body) catch {
+        try e.out.writeAll("could not reach the model; nothing was changed\n");
+        return;
+    };
+    const summary = try ha.dupe(u8, reply.content);
+    msgs.shrinkRetainingCapacity(1);
+    try msgs.append(ha, .{ .role = .user, .content = "(Earlier conversation, summarized.)" });
+    try msgs.append(ha, .{ .role = .assistant, .content = summary });
+    try e.out.print("compacted. Summary kept:\n{s}\n", .{summary});
+}
+
 /// Interactive session. Returns the process exit code.
-pub fn session(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool) !u8 {
+pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bool) !u8 {
+    var s = s_in;
     var e = e0;
     e.model = model;
     var hist_arena = std.heap.ArenaAllocator.init(e.gpa);
@@ -198,10 +249,22 @@ pub fn session(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool)
         for (st.todos.items) |t| e.gpa.free(t.text);
         st.todos.deinit(e.gpa);
         workflow.cleanup(e, &st); // stops every background task this session started
+        for (st.session_allow.items) |k| e.gpa.free(k);
+        st.session_allow.deinit(e.gpa);
     }
 
+    // Project notes, like CLAUDE.md: the first of AIMGR.md / AGENTS.md / CLAUDE.md in the first folder.
+    var notes_path: ?[]const u8 = null;
+    var notes_suffix: []const u8 = "";
+    if (s.dirs.len > 0) for ([_][]const u8{ "AIMGR.md", "AGENTS.md", "CLAUDE.md" }) |name| {
+        const p = try std.fmt.allocPrint(ha, "{s}/{s}", .{ s.dirs[0], name });
+        const text = std.Io.Dir.cwd().readFileAlloc(e.io, p, ha, .limited(16 * 1024)) catch continue;
+        notes_suffix = try std.fmt.allocPrint(ha, "\n\nProject notes from {s} (written by the user for this folder; follow them unless they conflict with the rules above):\n{s}", .{ name, text });
+        notes_path = p;
+        break;
+    };
     var msgs: std.ArrayList(chat.Msg) = .empty;
-    try msgs.append(ha, .{ .role = .system, .content = try systemPrompt(ha, s, &st) });
+    try msgs.append(ha, .{ .role = .system, .content = try std.mem.concat(ha, u8, &.{ try systemPrompt(ha, s, &st), notes_suffix }) });
 
     try e.out.print("agent ready: model {s}, level {s}, directories: ", .{ model, s.level.text() });
     for (s.dirs, 0..) |d, i| try e.out.print("{s}{s}", .{ if (i > 0) ", " else "", d });
@@ -211,15 +274,112 @@ pub fn session(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool)
         if (s.web) "on (each request asks)" else "off",
         if (s.subagents) "on" else "off",
     });
-    try e.out.writeAll("Type a request. Commands: /plan (plan first, then approve), /todos, /exit. Every change is shown before it happens.\n");
+    if (notes_path) |p| try e.out.print("project notes: {s}\n", .{p});
+    try e.out.writeAll("Type a request, or /help. Every change is shown before it happens; answer 'a' to stop asking for the same thing.\n");
     if (st.plan_mode) try e.out.writeAll("PLAN MODE: only reading tools until you approve a plan.\n");
 
     while (true) {
-        try e.out.writeAll("\nyou> ");
+        try e.out.print("\n[{s} · {s} · {s}]\nyou> ", .{ model, s.level.text(), modeText(&st) });
         try e.out.flush();
         const user = e.input.line() orelse return 0;
         if (user.len == 0) continue;
         if (std.mem.eql(u8, user, "/exit") or std.mem.eql(u8, user, "/quit")) return 0;
+        if (std.mem.eql(u8, user, "/help")) {
+            try e.out.writeAll(
+                \\  /mode [default|edits|plan]  edits = file edits in the folder are approved without asking
+                \\  /plan                       plan first: read-only until you approve a plan
+                \\  /add-dir PATH               let the model use another folder too (this session)
+                \\  /clear                      forget the conversation (keeps settings and approvals)
+                \\  /compact                    replace the conversation with a short summary (frees context)
+                \\  /status                     model, level, mode, folders, sandbox, shell, notes
+                \\  /rules                      your allow/deny rules and this session's 'always' answers
+                \\  /todos                      the model's task list
+                \\  /exit                       end the session
+                \\At an approval: y = yes, a = always (this session), anything else = no.
+                \\Project notes: put AIMGR.md (or AGENTS.md / CLAUDE.md) in the folder; it is read at start.
+                \\
+            );
+            continue;
+        }
+        if (std.mem.startsWith(u8, user, "/mode")) {
+            const arg = std.mem.trim(u8, user[5..], " ");
+            if (std.mem.eql(u8, arg, "edits")) {
+                st.auto_edits = true;
+                st.plan_mode = false;
+            } else if (std.mem.eql(u8, arg, "plan")) {
+                st.plan_mode = true;
+                st.auto_edits = false;
+            } else if (std.mem.eql(u8, arg, "default") or arg.len == 0) {
+                // bare /mode cycles like shift-tab in Claude Code: default -> edits -> plan -> default
+                if (arg.len == 0) {
+                    if (st.plan_mode) {
+                        st.plan_mode = false;
+                    } else if (st.auto_edits) {
+                        st.auto_edits = false;
+                        st.plan_mode = true;
+                    } else st.auto_edits = true;
+                } else {
+                    st.auto_edits = false;
+                    st.plan_mode = false;
+                }
+            } else {
+                try e.out.writeAll("modes: default, edits, plan\n");
+                continue;
+            }
+            try e.out.print("mode: {s}\n", .{modeText(&st)});
+            continue;
+        }
+        if (std.mem.startsWith(u8, user, "/add-dir")) {
+            const arg = std.mem.trim(u8, user["/add-dir".len..], " ");
+            if (arg.len == 0) {
+                try e.out.writeAll("usage: /add-dir PATH   (lets the model use that folder too, for this session)\n");
+                continue;
+            }
+            const real = std.Io.Dir.cwd().realPathFileAlloc(e.io, arg, ha) catch {
+                try e.out.print("not found: {s}\n", .{arg});
+                continue;
+            };
+            var dh = std.Io.Dir.cwd().openDir(e.io, real, .{}) catch {
+                try e.out.print("not a folder: {s}\n", .{arg});
+                continue;
+            };
+            dh.close(e.io);
+            const c = try policy.canonical(ha, real);
+            if (std.mem.eql(u8, c, "/") or (policy.is_windows and c.len <= 3)) {
+                try e.out.writeAll("refusing to add a whole drive or '/'; pick a folder\n");
+                continue;
+            }
+            var nd: std.ArrayList([]const u8) = .empty;
+            try nd.appendSlice(ha, s.dirs);
+            try nd.append(ha, c);
+            s.dirs = nd.items;
+            msgs.items[0].content = try std.mem.concat(ha, u8, &.{ try systemPrompt(ha, s, &st), notes_suffix });
+            try e.out.print("added for this session: {s}\n(to keep it: aimgr agent set <backend> <model> dirs=..., or the TUI)\n", .{c});
+            continue;
+        }
+        if (std.mem.eql(u8, user, "/clear")) {
+            msgs.shrinkRetainingCapacity(1);
+            try e.out.writeAll("conversation cleared\n");
+            continue;
+        }
+        if (std.mem.eql(u8, user, "/compact")) {
+            try compact(e, ha, &turn, &msgs);
+            continue;
+        }
+        if (std.mem.eql(u8, user, "/status")) {
+            try e.out.print("  model {s}, level {s}, mode {s}\n  folders: ", .{ model, s.level.text(), modeText(&st) });
+            for (s.dirs, 0..) |d, i| try e.out.print("{s}{s}", .{ if (i > 0) ", " else "", d });
+            try e.out.print("\n  sandbox: {s} (setting: {s}). shell: {s}. web: {s}\n  project notes: {s}\n  messages in context: {d}\n", .{ if (sandbox_on) "on" else "off", @tagName(s.sandbox), policy.effectiveShell(s).text(), if (s.web) "on" else "off", notes_path orelse "(none)", msgs.items.len - 1 });
+            continue;
+        }
+        if (std.mem.eql(u8, user, "/rules")) {
+            if (s.allow_rules.len + s.deny_rules.len + st.session_allow.items.len == 0) try e.out.writeAll("  no rules. Add some with: aimgr agent set <backend> <model> allow_rule='run_shell(git status*)'\n");
+            for (s.deny_rules) |r| try e.out.print("  deny   {s}\n", .{r});
+            for (s.allow_rules) |r| try e.out.print("  allow  {s}\n", .{r});
+            for (st.session_allow.items) |r| try e.out.print("  always {s}   (this session)\n", .{r});
+            if (st.auto_edits) try e.out.writeAll("  edits  auto-approved (edits mode)\n");
+            continue;
+        }
         if (std.mem.eql(u8, user, "/plan")) {
             st.plan_mode = true;
             try e.out.writeAll("plan mode on: the model can only read and must submit a plan for your approval.\n");

@@ -70,9 +70,28 @@ pub fn ask(e: Env, st: *State, question: []const u8) bool {
         e.out.print("\n  (approved automatically by your rule {s})\n", .{rule}) catch {};
         return true;
     }
-    e.out.print("\n  ? {s}{s}{s}{s}  [y/N] ", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question }) catch return false;
+    if (st.ask_edit and st.auto_edits) {
+        e.out.writeAll("  (approved: edits mode)\n") catch {};
+        return true;
+    }
+    if (st.ask_always) for (st.session_allow.items) |k| if (std.mem.eql(u8, k, st.ask_key)) {
+        e.out.print("  (approved: you said 'always' for {s} this session)\n", .{k}) catch {};
+        return true;
+    };
+    const choices: []const u8 = if (!st.ask_always) "[y/N]" else if (st.ask_edit) "[y/N/a=allow all edits this session]" else "[y/N/a=always this session]";
+    e.out.print("\n  ? {s}{s}{s}{s}  {s} ", .{ if (st.actor.len > 0) "[" else "", st.actor, if (st.actor.len > 0) "] " else "", question, choices }) catch return false;
     e.out.flush() catch return false;
     const l = e.input.line() orelse return false;
+    if (st.ask_always and (std.ascii.eqlIgnoreCase(l, "a") or std.ascii.eqlIgnoreCase(l, "always"))) {
+        if (st.ask_edit) {
+            st.auto_edits = true;
+            e.out.writeAll("  edits mode on: file edits in the allowed folders are approved for the rest of this session (/mode default to undo)\n") catch {};
+        } else if (e.gpa.dupe(u8, st.ask_key)) |k| {
+            st.session_allow.append(e.gpa, k) catch e.gpa.free(k);
+            e.out.print("  will not ask again this session for {s}\n", .{st.ask_key}) catch {};
+        } else |_| {}
+        return true;
+    }
     return std.ascii.eqlIgnoreCase(l, "y") or std.ascii.eqlIgnoreCase(l, "yes");
 }
 
@@ -106,6 +125,12 @@ fn mcpCall(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, ser
     if (parsed.value != .object) return denied(arena, "arguments must be an object");
     st.rule_allow = null;
     defer st.rule_allow = null;
+    st.ask_key = call.name;
+    st.ask_always = true;
+    defer {
+        st.ask_key = "";
+        st.ask_always = false;
+    }
     switch (policy.ruleCheck(s, call.name, call.args_json)) {
         .deny => |r| return denied(arena, try std.fmt.allocPrint(arena, "denied by your rule {s}", .{r})),
         .allow => |r| st.rule_allow = r,
@@ -152,7 +177,23 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Set
     // The user's own rules: a matching deny always wins; an allow rule answers approval prompts.
     st.rule_allow = null;
     defer st.rule_allow = null;
-    for (try ruleSubjects(arena, s, tool, args)) |subject| {
+    const subjects = try ruleSubjects(arena, s, tool, args);
+    st.ask_key = try std.fmt.allocPrint(arena, "{s}({s})", .{ @tagName(tool), subjects[0] orelse "" });
+    st.ask_edit = switch (tool) {
+        .write_file, .edit_file, .edit_notebook_cell, .make_dir, .move_file => true,
+        else => false,
+    };
+    // Never "always" for deleting, approving plans, or switching worktrees: those are asked every time.
+    st.ask_always = switch (tool) {
+        .delete_file, .submit_plan, .enter_worktree, .exit_worktree => false,
+        else => true,
+    };
+    defer {
+        st.ask_key = "";
+        st.ask_edit = false;
+        st.ask_always = false;
+    }
+    for (subjects) |subject| {
         const subj = subject orelse continue;
         switch (policy.ruleCheck(s, @tagName(tool), subj)) {
             .deny => |r| return denied(arena, try std.fmt.allocPrint(arena, "denied by your rule {s}", .{r})),

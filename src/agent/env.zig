@@ -46,6 +46,10 @@ pub const Env = struct {
     state_dir: ?[]const u8 = null,
     /// MCP servers from mcp.toml (user-chosen programs; tools need approval unless listed read-only).
     mcp: []const mcp.Server = &.{},
+    /// Render the model's replies as formatted Markdown (stdout is a terminal), with ANSI color, at this width.
+    markdown: bool = false,
+    color: bool = false,
+    width: u16 = 100,
 };
 
 pub const Audit = struct {
@@ -117,6 +121,15 @@ pub const Todo = struct {
 
 /// Mutable state of one conversation (shared with tool handlers). Strings live in the session arena.
 pub const State = struct {
+    /// The approval being asked right now: "tool(subject)", whether "always" may be offered for it, and
+    /// whether it is a file edit (auto-approved in edits mode).
+    ask_key: []const u8 = "",
+    ask_always: bool = false,
+    ask_edit: bool = false,
+    /// "Always" answers given in this session (owned by gpa). Session only: nothing is written to disk.
+    session_allow: std.ArrayList([]const u8) = .empty,
+    /// Edits mode: file edits inside the allowed directories are approved without asking.
+    auto_edits: bool = false,
     /// MCP tools found at the start of the session (null = not asked yet) and their function schemas.
     mcp_tools: ?[]const mcp.Tool = null,
     mcp_schemas: []const []const u8 = &.{},

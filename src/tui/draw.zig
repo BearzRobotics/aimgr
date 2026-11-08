@@ -453,7 +453,7 @@ fn drawSettingsLists(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h
                 if (!printed_agent_head) {
                     y += 1;
                     term.setAttr(term.A_BOLD | term.C_CYAN);
-                    term.put(top + y, 1, cols, "Agent mode: autonomy per tool-capable model   (Enter/space = next level; g on Installed starts it)");
+                    term.put(top + y, 1, cols, "Agent mode per model   (Enter = level, x = sandbox, h = shell, w = web; g on Installed starts it)");
                     y += 1;
                     printed_agent_head = true;
                 }
@@ -469,10 +469,13 @@ fn drawSettingsLists(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h
                     .catalog_hint => "tools: hint",
                     .unknown => "tools: ?",
                 };
-                const line = try std.fmt.allocPrint(a, "{s} level {s:<9} {s}  {s}", .{
+                const line = try std.fmt.allocPrint(a, "{s} level {s:<9} {s:<15} sandbox {s:<5} shell {s:<10} web {s:<3}  {s}", .{
                     prefix,
                     ag.level.text(),
                     if (ag.custom) "(yours)" else try std.fmt.allocPrint(a, "(default {s})", .{params}),
+                    @tagName(ag.sandbox orelse .auto),
+                    (ag.shell orelse @as(@import("../agent/policy.zig").Shell, if (@import("../agent/policy.zig").is_windows) .powershell else .bash)).text(),
+                    if (ag.web orelse false) "on" else "off",
                     tools_txt,
                 });
                 term.setAttr(if (picked) term.A_REVERSE else 0);

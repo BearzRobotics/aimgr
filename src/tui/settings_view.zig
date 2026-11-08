@@ -23,7 +23,27 @@ pub const AgentItem = struct {
     params_b: ?f64,
     stored_dirs: ?[]const []const u8,
     custom: bool,
+    /// Stored values (null = default) of the other per-model knobs shown and changed in the TUI.
+    sandbox: ?policy.Sandbox = null,
+    shell: ?policy.Shell = null,
+    web: ?bool = null,
 };
+
+pub fn nextSandbox(v: ?policy.Sandbox) policy.Sandbox {
+    return switch (v orelse .auto) {
+        .auto => .bwrap,
+        .bwrap => .none,
+        .none => .auto,
+    };
+}
+
+/// Shells offered on this OS, in cycle order (none = no run_shell tool).
+pub fn nextShell(v: ?policy.Shell) policy.Shell {
+    const order: []const policy.Shell = if (policy.is_windows) &.{ .powershell, .pwsh, .cmd, .none } else &.{ .bash, .sh, .dksh, .none };
+    const cur = v orelse order[0];
+    for (order, 0..) |o, i| if (o == cur) return order[(i + 1) % order.len];
+    return order[0];
+}
 
 pub const Item = union(enum) {
     source: usize,
@@ -86,6 +106,9 @@ pub fn items(
             .params_b = params,
             .stored_dirs = if (entry) |e| e.dirs else null,
             .custom = if (entry) |e| e.level != null else false,
+            .sandbox = if (entry) |e| e.sandbox else null,
+            .shell = if (entry) |e| e.shell else null,
+            .web = if (entry) |e| e.web else null,
         } });
     }
     return out.toOwnedSlice(arena);

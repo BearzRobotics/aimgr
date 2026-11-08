@@ -21,6 +21,7 @@ const agent_settings = @import("../agent/settings.zig");
 const abl = @import("../abliterate.zig");
 const hardware = @import("../hardware.zig");
 const agent_policy = @import("../agent/policy.zig");
+const policy = agent_policy;
 const settings_view = @import("settings_view.zig");
 const capcache = @import("../agent/capcache.zig");
 const sources_mod = @import("../sources.zig");
@@ -329,7 +330,9 @@ fn charKey(app: *App, ch: u21) void {
         'c' => chat(app),
         's' => startServer(app),
         'd' => askRowAction(app, .pull),
-        'x' => if (app.tab == .installed) askRowAction(app, .remove) else stopJob(app),
+        'x' => if (app.tab == .installed) askRowAction(app, .remove) else if (app.tab == .settings) settingsAgentKnob(app, .sandbox) else stopJob(app),
+        'h' => if (app.tab == .settings) settingsAgentKnob(app, .shell),
+        'w' => if (app.tab == .settings) settingsAgentKnob(app, .web),
         else => {},
     }
 }
@@ -759,6 +762,52 @@ fn settingsActivate(app: *App) void {
             } });
         },
     }
+}
+
+const Knob = enum { sandbox, shell, web };
+
+/// Settings tab, agent row: x = sandbox (auto/bwrap/none), h = shell, w = web tools. Saved like `aimgr agent set`.
+fn settingsAgentKnob(app: *App, knob: Knob) void {
+    const fa = app.frame.allocator();
+    const item = settingsCurrent(app) orelse return;
+    const ag = switch (item) {
+        .agent => |g| g,
+        .source => return app.setMessage(true, "select a model in the Agent list (x = sandbox, h = shell, w = web)", .{}),
+    };
+    var entries: std.ArrayList(agent_settings.Entry) = .empty;
+    entries.appendSlice(fa, app.agent_entries) catch return;
+    const model_id = fa.dupe(u8, ag.id) catch return; // ag.id lives in the arena refresh() frees
+    const k = agent_settings.find(entries.items, ag.backend, model_id) orelse blk: {
+        entries.append(fa, .{ .backend = ag.backend, .id = model_id }) catch return;
+        break :blk entries.items.len - 1;
+    };
+    const e = &entries.items[k];
+    var msg: []const u8 = "";
+    switch (knob) {
+        .sandbox => {
+            const v = settings_view.nextSandbox(e.sandbox);
+            e.sandbox = v;
+            msg = switch (v) {
+                .auto => "sandbox: auto (bubblewrap when available)",
+                .bwrap => "sandbox: bwrap (required; the agent will not start without it)",
+                .none => "sandbox: none (commands run with your full permissions; each still needs approval)",
+            };
+            if (policy.is_windows) msg = "sandbox setting saved (Windows has no sandbox: commands always run unsandboxed, each approved)";
+        },
+        .shell => {
+            const v = settings_view.nextShell(e.shell);
+            e.shell = v;
+            msg = std.fmt.allocPrint(fa, "shell: {s} (run_shell at level ask only)", .{v.text()}) catch "";
+        },
+        .web => {
+            const v = !(e.web orelse false);
+            e.web = v;
+            msg = if (v) "web tools on (each fetch/search asks first)" else "web tools off";
+        },
+    }
+    sources_io.saveAgents(fa, app.gpa, app.io, app.environ, entries.items) catch |er| return app.setMessage(true, "could not save the config: {s}", .{@errorName(er)});
+    refresh(app);
+    app.setMessage(false, "{s}: {s}", .{ model_id, msg });
 }
 
 /// `u` on a catalog-url source: download it now (explicit network step, runs as a job).

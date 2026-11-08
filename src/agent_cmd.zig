@@ -271,6 +271,13 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
     }
     const audit = try config.statePath(arena, env, "agent-audit.log");
     var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env), .state_dir = config.statePath(arena, env, "agent-bg") catch null, .mcp = loadMcp(arena, gpa, io, env, err) };
+    if (mode == .interactive and (std.Io.File.stdout().isTty(io) catch false)) {
+        renv.markdown = true;
+        const no_color = env.get("NO_COLOR") != null;
+        // Old Windows consoles may not understand ANSI; Windows Terminal sets WT_SESSION.
+        renv.color = !no_color and (!policy.is_windows or env.get("WT_SESSION") != null);
+        if (env.get("COLUMNS")) |c| renv.width = std.fmt.parseInt(u16, c, 10) catch 100;
+    }
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
     if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena);

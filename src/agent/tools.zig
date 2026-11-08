@@ -10,7 +10,7 @@ const schema_list_dir =
     \\{"type":"function","function":{"name":"list_dir","description":"List the entries of a directory with type and size.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path (absolute, or relative to the first allowed directory)"}},"required":["path"]}}}
 ;
 const schema_read_file =
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file. Large files are returned in pieces; use offset and limit (bytes) to continue.","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"Byte offset to start at (default 0)"},"limit":{"type":"integer","description":"Max bytes to return (default 16384)"}},"required":["path"]}}}
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file, or the text of a PDF (extracted automatically; never convert it yourself). Large files are returned in pieces; use offset and limit (bytes) to continue.","parameters":{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"Byte offset to start at (default 0)"},"limit":{"type":"integer","description":"Max bytes to return (default 16384)"}},"required":["path"]}}}
 ;
 const schema_run_command =
     \\{"type":"function","function":{"name":"run_command","description":"Run ONE command and return its output. There is no shell: no pipes, redirects, &&, ;, wildcards, ~ or $ expansion. Quote arguments with spaces. Example: grep -rn lion /stuff/Books/Animals","parameters":{"type":"object","properties":{"command":{"type":"string","description":"A single command line"}},"required":["command"]}}}
@@ -249,6 +249,7 @@ pub fn listDir(arena: std.mem.Allocator, io: std.Io, path: []const u8, max_entri
 }
 
 pub fn readFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, offset: u64, limit: u64, hard_max: u64) ![]const u8 {
+    if (std.ascii.endsWithIgnoreCase(path, ".pdf")) if (try pdfText(arena, io, path, offset, @min(limit, hard_max))) |t| return t;
     var f = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
     const len = try f.length(io);
@@ -264,6 +265,24 @@ pub fn readFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, offset: 
     try out.appendSlice(arena, data);
     if (offset + n < len) try out.print(arena, "\n[... file continues: {d} of {d} bytes shown; call read_file again with offset={d} ...]", .{ offset + n, len, offset + n });
     return out.toOwnedSlice(arena);
+}
+
+/// Text of a PDF via `pdftotext` (poppler) when it is installed; null = not available (caller shows "binary").
+/// `offset`/`limit` apply to the extracted text, so long books can be read in parts.
+fn pdfText(arena: std.mem.Allocator, io: std.Io, path: []const u8, offset: u64, limit: u64) !?[]const u8 {
+    const r = process.run(arena, io, &.{ "pdftotext", "-q", "-layout", path, "-" }, 60, null, 64 * 1024 * 1024);
+    switch (r.outcome) {
+        .exited => |c| if (c != 0) return null,
+        else => return null,
+    }
+    const text = r.stdout;
+    if (std.mem.trim(u8, text, " \t\r\n\x0c").len == 0) return try arena.dupe(u8, "[this PDF has no text layer: it is scanned page images, so there is no text to read (OCR would be needed)]");
+    if (offset >= text.len) return try std.fmt.allocPrint(arena, "[offset {d} is past the end of the extracted text ({d} bytes)]", .{ offset, text.len });
+    const end: usize = @intCast(@min(text.len, offset + limit));
+    var out: std.ArrayList(u8) = .empty;
+    try out.print(arena, "[text extracted from PDF with pdftotext]\n{s}", .{text[@intCast(offset)..end]});
+    if (end < text.len) try out.print(arena, "\n[... text continues: {d} of {d} bytes shown; call read_file again with offset={d} ...]", .{ end, text.len, end });
+    return try out.toOwnedSlice(arena);
 }
 
 pub fn writeFile(io: std.Io, path: []const u8, content: []const u8) !void {
