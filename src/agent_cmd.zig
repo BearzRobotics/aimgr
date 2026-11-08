@@ -25,7 +25,7 @@ pub const usage =
     \\  aimgr agent settings                        all stored per-model settings
     \\  aimgr agent set <ollama|llama> <model> key=value...
     \\        keys: level=  dirs=/a,/b  steps=N  timeout=S  output_kb=N  allow=cmd,cmd  sandbox=  root=true|false
-    \\              shell=none|bash|sh|dksh (run_shell, level ask only)  web=true|false  subagents=true|false
+    \\              shell=none|bash|sh|dksh|powershell|pwsh|cmd (run_shell, level ask only)  web=true|false  subagents=true|false
     \\              plan=true|false (start in plan mode)  search_url=https://host/?q={q}  (enables web_search)
     \\  aimgr agent reset <ollama|llama> <model>    forget a model's stored settings
     \\
@@ -150,11 +150,6 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         return 0;
     }
 
-    if (@import("builtin").os.tag == .windows) {
-        try err.writeAll("aimgr: agent mode is not available on Windows yet (it needs a sandbox and POSIX path rules). Everything else works.\n");
-        return 1;
-    }
-
     // ---- run a session ----
     if (args.len < 2) return fail(err, usage);
     const kind = std.meta.stringToEnum(backend.Kind, args[0]) orelse return fail(err, usage);
@@ -226,11 +221,12 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
             return 1;
         };
         dh.close(io);
-        if (std.mem.eql(u8, real, "/")) {
+        const real_c = try policy.canonical(arena, real);
+        if (std.mem.eql(u8, real_c, "/") or (policy.is_windows and real_c.len <= 3 and real_c.len >= 2 and real_c[1] == ':')) {
             try err.writeAll("aimgr: refusing to give a model access to '/'; pick a specific directory\n");
             return 1;
         }
-        try dirs.append(arena, try arena.dupe(u8, real));
+        try dirs.append(arena, real_c);
     }
     eff.s.dirs = dirs.items;
     // Folders the user already chose (stored for this model, or trusted before) need no question; a new one

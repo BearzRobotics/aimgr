@@ -34,7 +34,7 @@ pub fn isListening(gpa: std.mem.Allocator, io: std.Io, port: u16) bool {
     if (@import("builtin").os.tag == .windows) {
         // No /proc: try to connect to the loopback port.
         const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return false;
-        var stream = addr.connect(io, .{ .mode = .stream, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } } }) catch return false;
+        var stream = addr.connect(io, .{ .mode = .stream }) catch return false;
         stream.close(io);
         return true;
     }

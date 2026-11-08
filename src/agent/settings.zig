@@ -11,7 +11,7 @@
 //!   allow_commands = ["md5sum"]    # extra read-only commands (names only)
 //!   sandbox = "auto"               # auto | bwrap | none
 //!   allow_root = false
-//!   shell = "bash"                 # none | bash | sh | dksh (only used at level ask)
+//!   shell = "bash"                 # none | bash | sh | dksh | powershell | pwsh | cmd (only used at level ask)
 //!   web = false                    # web_fetch / web_search tools (each request asks)
 //!   subagents = true
 //!   plan = false                   # start sessions in plan mode

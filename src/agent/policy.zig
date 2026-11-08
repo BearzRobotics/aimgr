@@ -4,6 +4,9 @@
 //! Decisions: `.auto` (runs without a prompt), `.ask` (needs the user's keypress, with a reason),
 //! `.deny` (never runs, reason is returned to the model so it can adapt).
 const std = @import("std");
+const builtin = @import("builtin");
+
+pub const is_windows = builtin.os.tag == .windows;
 
 pub const Level = enum {
     /// Chat only; no tools are offered.
@@ -52,6 +55,24 @@ pub const Shell = enum {
     bash,
     sh,
     dksh,
+    /// Windows PowerShell 5.1 (powershell.exe), PowerShell 7 (pwsh.exe) and cmd.exe.
+    powershell,
+    pwsh,
+    cmd,
+
+    pub fn isWindowsShell(self: Shell) bool {
+        return self == .powershell or self == .pwsh or self == .cmd;
+    }
+
+    /// Executable name looked up on PATH.
+    pub fn exeName(self: Shell) []const u8 {
+        return switch (self) {
+            .powershell => "powershell.exe",
+            .pwsh => "pwsh.exe",
+            .cmd => "cmd.exe",
+            else => @tagName(self),
+        };
+    }
 
     pub fn text(self: Shell) []const u8 {
         return @tagName(self);
@@ -94,7 +115,7 @@ pub const Settings = struct {
 /// The shell run_shell would use: only at level `ask`, bash unless configured otherwise.
 pub fn effectiveShell(s: Settings) Shell {
     if (s.level != .ask) return .none;
-    return s.shell orelse .bash;
+    return s.shell orelse (if (is_windows) .powershell else .bash);
 }
 
 /// Default autonomy from what the model can do. Small models are unreliable at tool use, so they get
@@ -125,10 +146,49 @@ pub const Decision = union(enum) {
 // ---------------------------------------------------------------------------------------------
 // Paths
 
-/// Lexically normalize `path` (absolute, or relative to `base`): collapse `//`, `.` and `..`.
-/// Never goes above `/`. Does not touch the filesystem (symlinks are checked separately).
 pub fn normalizePath(arena: std.mem.Allocator, base: []const u8, path: []const u8) ![]u8 {
-    const joined = if (path.len > 0 and path[0] == '/') try arena.dupe(u8, path) else try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, path });
+    return normalizeWith(is_windows, arena, base, path);
+}
+
+/// Windows: backslashes become '/' and the "\\?\\" prefix is dropped. Elsewhere the text is unchanged.
+/// Inside the agent every path uses '/' (Windows file APIs accept it) and drives look like "C:/dir".
+pub fn canonicalWith(win: bool, arena: std.mem.Allocator, path: []const u8) ![]u8 {
+    var p = path;
+    if (win) {
+        if (std.mem.startsWith(u8, p, "\\\\?\\") and p.len > 4 and !std.mem.startsWith(u8, p[4..], "UNC")) p = p[4..];
+    }
+    const out = try arena.dupe(u8, p);
+    if (win) for (out) |*c| if (c.* == '\\') {
+        c.* = '/';
+    };
+    return out;
+}
+
+pub fn canonical(arena: std.mem.Allocator, path: []const u8) ![]u8 {
+    return canonicalWith(is_windows, arena, path);
+}
+
+fn isDrivePrefix(p: []const u8) bool {
+    return p.len >= 2 and std.ascii.isAlphabetic(p[0]) and p[1] == ':';
+}
+
+pub fn normalizeWith(win: bool, arena: std.mem.Allocator, base_in: []const u8, path_in: []const u8) ![]u8 {
+    const base = try canonicalWith(win, arena, base_in);
+    const path = try canonicalWith(win, arena, path_in);
+    var drive: ?u8 = null;
+    var joined: []const u8 = undefined;
+    if (win) {
+        if (isDrivePrefix(path)) {
+            drive = std.ascii.toUpper(path[0]);
+            joined = path[2..];
+            // "C:foo" (drive-relative) is treated as "C:/foo" from the root: never relative to a hidden cwd.
+        } else {
+            if (isDrivePrefix(base)) drive = std.ascii.toUpper(base[0]);
+            joined = if (path.len > 0 and path[0] == '/') path else try std.fmt.allocPrint(arena, "{s}/{s}", .{ if (isDrivePrefix(base)) base[2..] else base, path });
+        }
+    } else {
+        joined = if (path.len > 0 and path[0] == '/') path else try std.fmt.allocPrint(arena, "{s}/{s}", .{ base, path });
+    }
     var parts: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeScalar(u8, joined, '/');
     while (it.next()) |seg| {
@@ -139,8 +199,15 @@ pub fn normalizePath(arena: std.mem.Allocator, base: []const u8, path: []const u
         }
         try parts.append(arena, seg);
     }
-    if (parts.items.len == 0) return arena.dupe(u8, "/");
     var out: std.ArrayList(u8) = .empty;
+    if (drive) |dl| {
+        try out.append(arena, dl);
+        try out.append(arena, ':');
+    }
+    if (parts.items.len == 0) {
+        try out.append(arena, '/');
+        return out.toOwnedSlice(arena);
+    }
     for (parts.items) |seg| {
         try out.append(arena, '/');
         try out.appendSlice(arena, seg);
@@ -148,15 +215,46 @@ pub fn normalizePath(arena: std.mem.Allocator, base: []const u8, path: []const u
     return out.toOwnedSlice(arena);
 }
 
+/// Windows paths that can alias or escape ("\\server\share", device names like CON/NUL, "file:stream",
+/// trailing dots or spaces, wildcard characters). Checked on the canonical ('/') form.
+pub fn windowsPathBad(canon: []const u8) bool {
+    if (std.mem.startsWith(u8, canon, "//")) return true;
+    const rest = if (isDrivePrefix(canon)) canon[2..] else canon;
+    if (std.mem.indexOfAny(u8, rest, ":*?\"<>|") != null) return true;
+    var it = std.mem.tokenizeScalar(u8, rest, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        const last = seg[seg.len - 1];
+        if ((last == '.' or last == ' ') and !std.mem.eql(u8, seg, ".") and !std.mem.eql(u8, seg, "..")) return true;
+        const dot = std.mem.indexOfScalar(u8, seg, '.') orelse seg.len;
+        const stem = std.mem.trimEnd(u8, seg[0..dot], " ");
+        const reserved = [_][]const u8{ "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" };
+        for (reserved) |r| if (std.ascii.eqlIgnoreCase(stem, r)) return true;
+        if (stem.len == 4 and (std.ascii.startsWithIgnoreCase(stem, "COM") or std.ascii.startsWithIgnoreCase(stem, "LPT")) and stem[3] >= '1' and stem[3] <= '9') return true;
+    }
+    return false;
+}
+
 /// True if normalized `path` is `dir` or below it (component boundary, so /a/bc is not within /a/b).
+/// On Windows letters compare case-insensitively.
 pub fn within(dirs: []const []const u8, path: []const u8) bool {
+    return withinWith(is_windows, dirs, path);
+}
+
+pub fn withinWith(win: bool, dirs: []const []const u8, path: []const u8) bool {
     // Defensive: an un-normalized path with ".." could pass a prefix check while escaping.
     var segs = std.mem.tokenizeScalar(u8, path, '/');
     while (segs.next()) |seg| if (std.mem.eql(u8, seg, "..")) return false;
-    for (dirs) |d| {
-        if (std.mem.eql(u8, d, "/")) return true;
-        if (std.mem.eql(u8, path, d)) return true;
-        if (path.len > d.len and std.mem.startsWith(u8, path, d) and path[d.len] == '/') return true;
+    for (dirs) |d_in| {
+        const d = std.mem.trimEnd(u8, d_in, "/");
+        if (d.len == 0) return true; // "/" itself
+        const eq = struct {
+            fn f(w: bool, x: []const u8, y: []const u8) bool {
+                return if (w) std.ascii.eqlIgnoreCase(x, y) else std.mem.eql(u8, x, y);
+            }
+        }.f;
+        if (eq(win, path, d)) return true;
+        if (path.len > d.len and eq(win, path[0..d.len], d) and path[d.len] == '/') return true;
     }
     return false;
 }
@@ -170,7 +268,7 @@ pub fn looksSensitive(path: []const u8) bool {
     for (suffixes) |sfx| if (std.ascii.endsWithIgnoreCase(base, sfx)) return true;
     if (std.ascii.startsWithIgnoreCase(base, ".env.")) return true;
     // directories that hold secrets
-    var it = std.mem.tokenizeScalar(u8, path, '/');
+    var it = std.mem.tokenizeAny(u8, path, "/\\");
     while (it.next()) |seg| {
         if (std.mem.eql(u8, seg, ".ssh") or std.mem.eql(u8, seg, ".gnupg") or std.mem.eql(u8, seg, ".aws") or std.mem.eql(u8, seg, ".kube")) return true;
     }
@@ -233,7 +331,11 @@ pub fn splitCommand(arena: std.mem.Allocator, s: []const u8) SplitError![]const 
                 }
                 if (i >= s.len) return error.UnbalancedQuote;
             },
-            '\\' => {
+            '\\' => if (is_windows) {
+                // A path separator, not an escape.
+                have = true;
+                try cur.append(arena, c);
+            } else {
                 if (i + 1 >= s.len) return error.ShellSyntax;
                 have = true;
                 i += 1;
@@ -252,15 +354,16 @@ pub fn splitCommand(arena: std.mem.Allocator, s: []const u8) SplitError![]const 
     return out.toOwnedSlice(arena);
 }
 
-const root_escalators = [_][]const u8{ "sudo", "su", "doas", "pkexec", "run0" };
+const root_escalators = [_][]const u8{ "sudo", "su", "doas", "pkexec", "run0", "gsudo" };
 /// Interpreters and wrappers that can run arbitrary other commands: denied outright.
-const shell_like = [_][]const u8{ "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "ash", "busybox", "env", "xargs", "nohup", "eval", "exec", "setsid", "timeout", "nice", "ionice", "stdbuf", "script", "watch", "time", "command", "builtin", "chroot", "unshare", "nsenter", "flock" };
+const shell_like = [_][]const u8{ "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "ash", "busybox", "env", "xargs", "nohup", "eval", "exec", "setsid", "timeout", "nice", "ionice", "stdbuf", "script", "watch", "time", "command", "builtin", "chroot", "unshare", "nsenter", "flock", "powershell", "pwsh", "cmd", "wscript", "cscript", "mshta", "wsl", "start", "runas" };
 /// Interpreters that are legitimate tools but can run anything: approval-gated at level ask.
 const interpreters = [_][]const u8{ "python", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "awk", "gawk", "sed", "ssh", "scp", "rsync", "curl", "wget", "nc", "ncat", "socat", "make", "cargo", "go", "zig", "gcc", "cc", "tar", "unzip", "zip", "git" };
 /// Obviously destructive or system-changing: approval-gated with a stronger reason.
 const destructive = [_][]const u8{ "rm", "rmdir", "mv", "cp", "dd", "shred", "truncate", "chmod", "chown", "chgrp", "ln", "mkfs", "fdisk", "parted", "mount", "umount", "kill", "killall", "pkill", "systemctl", "service", "reboot", "shutdown", "poweroff", "apt", "apt-get", "dpkg", "snap", "pip", "pip3", "npm", "useradd", "userdel", "passwd", "crontab", "iptables", "ufw", "modprobe", "insmod", "rmmod", "mkdir", "touch", "tee", "install" };
 /// Commands that only read and print (further checked for flags and path arguments).
 const read_only_cmds = [_][]const u8{ "ls", "cat", "head", "tail", "grep", "find", "wc", "file", "stat", "du", "df", "pwd", "tree", "basename", "dirname", "realpath", "readlink", "date", "uname", "whoami", "id", "hostname", "which", "nproc", "uptime", "free", "lsblk" };
+const windows_read_only_cmds = [_][]const u8{ "where", "hostname", "whoami", "tasklist", "ver" };
 const git_ok_sub = [_][]const u8{ "status", "log", "diff", "show", "branch", "ls-files", "rev-parse", "remote", "shortlog", "describe" };
 const find_bad_flags = [_][]const u8{ "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls" };
 
@@ -283,9 +386,10 @@ pub const Command = struct {
 pub fn classifyCommand(arena: std.mem.Allocator, s: Settings, argv: []const []const u8) !Command {
     if (argv.len == 0) return .{ .decision = .{ .deny = "empty command" }, .kind = "invalid" };
     if (!s.level.atLeast(.inspect)) return .{ .decision = .{ .deny = "running commands needs level 'inspect' or 'ask' for this model" }, .kind = "command" };
-    const first = argv[0];
-    const has_slash = std.mem.indexOfScalar(u8, first, '/') != null;
-    const name = std.fs.path.basename(first);
+    const first = if (is_windows) try canonical(arena, argv[0]) else argv[0];
+    const has_slash = std.mem.indexOfScalar(u8, first, '/') != null or (is_windows and isDrivePrefix(first));
+    var name = std.fs.path.basename(first);
+    if (is_windows and std.ascii.endsWithIgnoreCase(name, ".exe")) name = name[0 .. name.len - 4];
 
     if (inSet(&root_escalators, name)) {
         if (!s.allow_root) return .{ .decision = .{ .deny = "privilege escalation (sudo/su/doas) is disabled for this model" }, .kind = "root" };
@@ -294,7 +398,7 @@ pub fn classifyCommand(arena: std.mem.Allocator, s: Settings, argv: []const []co
     }
     if (inSet(&shell_like, name)) return .{ .decision = .{ .deny = "shell interpreters and command wrappers are not allowed; give one plain command per call" }, .kind = "shell" };
 
-    if (!has_slash and (inSet(&read_only_cmds, name) or inSet(s.allow_commands, name) or std.mem.eql(u8, name, "git"))) {
+    if (!has_slash and (inSet(if (is_windows) &windows_read_only_cmds else &read_only_cmds, name) or inSet(s.allow_commands, name) or std.mem.eql(u8, name, "git"))) {
         if (try readOnlyArgsOk(arena, s, name, argv)) |why_not| return why_not;
         return .{ .decision = .auto, .kind = "read-only command" };
     }
@@ -387,7 +491,7 @@ pub fn wildcardMatch(pat: []const u8, text: []const u8) bool {
 
 /// Characters that give a shell string a second meaning (chaining, redirection, expansion, newlines).
 pub fn hasShellMeta(subject: []const u8) bool {
-    return std.mem.indexOfAny(u8, subject, ";|&<>$`()\n\r\\{}!") != null;
+    return std.mem.indexOfAny(u8, subject, ";|&<>$`()\n\r\\{}!^%") != null;
 }
 
 pub const RuleResult = union(enum) {
@@ -650,4 +754,34 @@ test "deny beats allow; shell allow-rules cannot be chained" {
     try std.testing.expect(ruleCheck(s, "run_shell", "echo hi") == .allow); // exact rule, no wildcard
     try std.testing.expect(ruleCheck(s, "run_shell", "echo hi; id") == .none);
     try std.testing.expect(hasShellMeta("a | b") and hasShellMeta("a\nb") and !hasShellMeta("zig build test"));
+}
+
+test "windows path rules (checked on any host)" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const al = a.allocator();
+    try std.testing.expectEqualStrings("C:/Users/me/x.txt", try normalizeWith(true, al, "C:/Users/me", "x.txt"));
+    try std.testing.expectEqualStrings("C:/Users/me/sub/y", try normalizeWith(true, al, "C:\\Users\\me", "sub\\y"));
+    try std.testing.expectEqualStrings("D:/data/z", try normalizeWith(true, al, "C:/Users/me", "d:\\data\\z"));
+    try std.testing.expectEqualStrings("C:/Users", try normalizeWith(true, al, "C:/Users/me", "../"));
+    try std.testing.expectEqualStrings("C:/", try normalizeWith(true, al, "C:/Users/me", "../../.."));
+    try std.testing.expectEqualStrings("C:/etc", try normalizeWith(true, al, "C:/Users/me", "/etc"));
+    try std.testing.expectEqualStrings("C:/Users/me/x", try normalizeWith(true, al, "\\\\?\\C:\\Users\\me", "x"));
+    const dirs = [_][]const u8{"C:/Users/me"};
+    try std.testing.expect(withinWith(true, &dirs, "c:/users/ME/doc.txt"));
+    try std.testing.expect(!withinWith(true, &dirs, "C:/Users/mex/doc.txt"));
+    try std.testing.expect(!withinWith(true, &dirs, "D:/Users/me"));
+    try std.testing.expect(withinWith(true, &.{"C:/"}, "C:/anything"));
+    try std.testing.expect(!withinWith(true, &.{"C:/"}, "D:/anything"));
+    // posix stays case-sensitive
+    try std.testing.expect(!withinWith(false, &.{"/a/B"}, "/a/b/c"));
+}
+
+test "windows path hazards" {
+    for ([_][]const u8{ "//server/share/x", "C:/dir/NUL", "C:/dir/nul.txt", "C:/COM1", "C:/a/file.txt:stream", "C:/a/b.", "C:/a/b ", "C:/a/*.txt", "C:/a/LPT3.log" }) |bad| {
+        try std.testing.expect(windowsPathBad(bad));
+    }
+    for ([_][]const u8{ "C:/Users/me/readme.md", "C:/a/console.txt", "D:/x/COM10", "C:/a/.git/config" }) |ok| {
+        try std.testing.expect(!windowsPathBad(ok));
+    }
 }

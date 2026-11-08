@@ -87,11 +87,15 @@ fn schemaRunShell(arena: std.mem.Allocator, sh: policy.Shell) ![]u8 {
         .dksh => "The shell is dksh, a C-like scripting shell that is NOT POSIX sh: do not send POSIX-only syntax.",
         .bash => "The shell is bash.",
         .sh => "The shell is POSIX sh.",
+        .powershell => "The shell is Windows PowerShell 5.1: use PowerShell syntax (Get-ChildItem, Get-Content, Select-String, ';' to chain, no '&&').",
+        .pwsh => "The shell is PowerShell 7 (pwsh): use PowerShell syntax (Get-ChildItem, Get-Content, Select-String).",
+        .cmd => "The shell is Windows cmd.exe: use cmd syntax (dir, type, findstr, '&' to chain).",
         .none => "",
     };
+    const where: []const u8 = if (sh.isWindowsShell()) "It runs with the user's own permissions and is NOT sandboxed (file access is limited only by the approval you ask for); it starts in the first allowed directory." else "It runs in a sandbox with no network, with write access only to the allowed directories.";
     return std.fmt.allocPrint(arena,
-        \\{{"type":"function","function":{{"name":"run_shell","description":"Run a command line through a real shell (pipes, redirects, && and variables work). {s} It runs in a sandbox with no network, with write access only to the allowed directories. The user is asked to approve every use and sees the exact text. Prefer run_command for simple read-only commands.","parameters":{{"type":"object","properties":{{"command":{{"type":"string"}}}},"required":["command"]}}}}}}
-    , .{note});
+        \\{{"type":"function","function":{{"name":"run_shell","description":"Run a command line through a real shell (pipes, redirects, && and variables work). {s} {s} The user is asked to approve every use and sees the exact text. Prefer run_command for simple read-only commands.","parameters":{{"type":"object","properties":{{"command":{{"type":"string"}}}},"required":["command"]}}}}}}
+    , .{ note, where });
 }
 
 /// What the model may be offered right now.
@@ -186,18 +190,23 @@ pub const ResolveError = error{ OutsideDirs, NotFound, OutOfMemory, BadPath };
 pub fn resolve(arena: std.mem.Allocator, io: std.Io, s: policy.Settings, path: []const u8, must_exist: bool) ResolveError![]const u8 {
     if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.BadPath;
     const base = if (s.dirs.len > 0) s.dirs[0] else "/";
+    if (policy.is_windows) {
+        const c = policy.canonical(arena, path) catch return error.OutOfMemory;
+        if (policy.windowsPathBad(c)) return error.BadPath;
+    }
     const norm = policy.normalizePath(arena, base, path) catch return error.OutOfMemory;
     // The directories themselves may be symlinks; compare against their real locations too.
     var real_dirs: std.ArrayList([]const u8) = .empty;
     for (s.dirs) |d| {
         real_dirs.append(arena, d) catch return error.OutOfMemory;
-        if (std.Io.Dir.cwd().realPathFileAlloc(io, d, arena)) |rd| real_dirs.append(arena, rd) catch return error.OutOfMemory else |_| {}
+        if (std.Io.Dir.cwd().realPathFileAlloc(io, d, arena)) |rd| real_dirs.append(arena, policy.canonical(arena, rd) catch return error.OutOfMemory) catch return error.OutOfMemory else |_| {}
     }
     const target = if (must_exist) norm else (std.fs.path.dirname(norm) orelse "/");
-    const real = std.Io.Dir.cwd().realPathFileAlloc(io, target, arena) catch |e| switch (e) {
+    const real_raw = std.Io.Dir.cwd().realPathFileAlloc(io, target, arena) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => if (must_exist) return error.NotFound else return error.NotFound,
     };
+    const real = policy.canonical(arena, real_raw) catch return error.OutOfMemory;
     // Policy decided on the lexical path; a symlink must not lead somewhere else.
     if (!policy.within(real_dirs.items, real) and policy.within(s.dirs, norm)) return error.OutsideDirs;
     return norm;
@@ -599,17 +608,24 @@ pub fn isBlockedHost(host_in: []const u8) bool {
 
 /// Absolute path of an executable named `name` found in `path_env` (colon separated), plus a few usual spots.
 pub fn findExecutable(arena: std.mem.Allocator, io: std.Io, name: []const u8, path_env: ?[]const u8, home: ?[]const u8) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
-    var it = std.mem.tokenizeScalar(u8, path_env orelse "/usr/local/bin:/usr/bin:/bin", ':');
+    if (std.mem.indexOfAny(u8, name, "/\\") != null) return null;
+    const win = policy.is_windows;
+    var it = std.mem.tokenizeScalar(u8, path_env orelse (if (win) "" else "/usr/local/bin:/usr/bin:/bin"), if (win) ';' else ':');
     while (it.next()) |d| {
-        if (d.len == 0 or d[0] != '/') continue;
-        const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, d, "/"), name }) catch return null;
-        if (std.Io.Dir.cwd().access(io, p, .{ .execute = true })) |_| return p else |_| {}
+        if (d.len == 0 or !std.fs.path.isAbsolute(d)) continue;
+        const dir = std.mem.trimEnd(u8, d, "/\\");
+        const sep: []const u8 = if (win) "\\" else "/";
+        const p = std.fmt.allocPrint(arena, "{s}{s}{s}", .{ dir, sep, name }) catch return null;
+        if (std.Io.Dir.cwd().access(io, p, .{ .execute = !win })) |_| return p else |_| {}
+        if (win and std.fs.path.extension(name).len == 0) {
+            const pe = std.fmt.allocPrint(arena, "{s}.exe", .{p}) catch return null;
+            if (std.Io.Dir.cwd().access(io, pe, .{})) |_| return pe else |_| {}
+        }
     }
-    if (home) |h| {
+    if (!win) if (home) |h| {
         const p = std.fmt.allocPrint(arena, "{s}/.local/bin/{s}", .{ h, name }) catch return null;
         if (std.Io.Dir.cwd().access(io, p, .{ .execute = true })) |_| return p else |_| {}
-    }
+    };
     return null;
 }
 
@@ -619,6 +635,9 @@ pub fn shellArgv(arena: std.mem.Allocator, sh: policy.Shell, shell_path: []const
     return switch (sh) {
         .bash => arena.dupe([]const u8, &.{ shell_path, "--noprofile", "--norc", "-c", command }),
         .sh, .dksh => arena.dupe([]const u8, &.{ shell_path, "-c", command }),
+        // No profile, no prompts, and a script that fails reports a non-zero exit code.
+        .powershell, .pwsh => arena.dupe([]const u8, &.{ shell_path, "-NoProfile", "-NonInteractive", "-Command", command }),
+        .cmd => arena.dupe([]const u8, &.{ shell_path, "/d", "/s", "/c", command }),
         .none => error.NoShell,
     };
 }
@@ -629,7 +648,7 @@ pub fn mentionsRootEscalation(command: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, command, " \t\n;&|()`$<>{}");
     while (it.next()) |w| {
         const base = std.fs.path.basename(w);
-        for ([_][]const u8{ "sudo", "su", "doas", "pkexec", "run0" }) |bad| if (std.mem.eql(u8, base, bad)) return true;
+        for ([_][]const u8{ "sudo", "su", "doas", "pkexec", "run0", "gsudo", "runas" }) |bad| if (std.mem.eql(u8, base, bad)) return true;
     }
     return false;
 }
@@ -647,15 +666,44 @@ pub fn shellWarnings(command: []const u8) []const u8 {
         .{ "> /dev/", "writes to a device" },
         .{ "chmod -R", "recursive permission change" },
         .{ ":(){", "fork bomb pattern" },
+        // Windows
+        .{ "-recurse", "recursive operation (check what it deletes)" },
+        .{ "remove-item", "deletes files" },
+        .{ "rd /s", "recursive delete" },
+        .{ "rmdir /s", "recursive delete" },
+        .{ "del /s", "recursive delete" },
+        .{ "format-volume", "formats a disk" },
+        .{ "format ", "may format a disk" },
+        .{ "invoke-expression", "runs text as code" },
+        .{ "iex ", "runs text as code" },
+        .{ "| iex", "pipes into code execution" },
+        .{ "-encodedcommand", "hides what it runs" },
+        .{ "invoke-webrequest", "downloads from the network" },
+        .{ "invoke-restmethod", "talks to the network" },
+        .{ "set-executionpolicy", "changes security settings" },
+        .{ "reg delete", "deletes registry keys" },
+        .{ "reg add", "changes the registry" },
+        .{ "-verb runas", "asks for administrator rights" },
+        .{ "stop-computer", "shuts the computer down" },
+        .{ "restart-computer", "restarts the computer" },
+        .{ "shutdown", "shuts the computer down" },
     };
-    for (probes) |p| if (std.mem.indexOf(u8, command, p[0]) != null) return p[1];
+    for (probes) |p| if (containsFold(command, p[0])) return p[1];
     return "";
+}
+
+fn containsFold(h: []const u8, n: []const u8) bool {
+    if (n.len > h.len) return false;
+    var i: usize = 0;
+    while (i + n.len <= h.len) : (i += 1) if (std.ascii.eqlIgnoreCase(h[i .. i + n.len], n)) return true;
+    return false;
 }
 
 // ---- command execution ----------------------------------------------------------------------
 
 /// True when `bwrap` can create the sandbox on this machine (it is installed AND user namespaces work).
 pub fn sandboxAvailable(gpa: std.mem.Allocator, io: std.Io) bool {
+    if (policy.is_windows) return false; // no bubblewrap here
     const r = process.run(gpa, io, &.{ "bwrap", "--ro-bind", "/", "/", "--unshare-all", "true" }, 5, null, 4096);
     defer r.deinit(gpa);
     return r.ok();
@@ -1047,4 +1095,17 @@ test "feature-driven schemas: plan mode, shell, web, subagents" {
     try std.testing.expect(!has(low, "run_shell") and !has(low, "web_fetch") and has(low, "run_command"));
     const p = try std.json.parseFromSlice(std.json.Value, a.allocator(), full, .{});
     try std.testing.expect(p.value == .array);
+}
+
+test "powershell and cmd argv" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const p = try shellArgv(a.allocator(), .powershell, "C:/x/powershell.exe", "Get-ChildItem");
+    try std.testing.expectEqualStrings("-NoProfile", p[1]);
+    try std.testing.expectEqualStrings("-Command", p[3]);
+    try std.testing.expectEqualStrings("Get-ChildItem", p[4]);
+    const c = try shellArgv(a.allocator(), .cmd, "C:/x/cmd.exe", "dir");
+    try std.testing.expectEqualStrings("/c", c[3]);
+    try std.testing.expect(shellWarnings("Remove-Item -Recurse C:\\x").len > 0);
+    try std.testing.expect(mentionsRootEscalation("gsudo del x"));
 }
