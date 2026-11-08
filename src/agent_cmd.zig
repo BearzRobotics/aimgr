@@ -11,22 +11,26 @@ const policy = @import("agent/policy.zig");
 const settings = @import("agent/settings.zig");
 const tools = @import("agent/tools.zig");
 const run = @import("agent/run.zig");
+const chat = @import("agent/chat.zig");
+const llama_server = @import("agent/llama_server.zig");
+const hardware = @import("hardware.zig");
 
 pub const usage =
     \\usage:
-    \\  aimgr agent <ollama> <model> [--dir DIR]... [--level off|read-only|inspect|ask]
+    \\  aimgr agent <ollama|llama> <model> [--dir DIR]... [--level off|read-only|inspect|ask]
     \\                               [--steps N] [--timeout S] [--sandbox auto|bwrap|none]
     \\      Chat with a tool-capable model that can look at files and (depending on its level) run commands.
-    \\  aimgr agent show <ollama> <model>           effective settings for a model (defaults + stored)
+    \\  aimgr agent show <ollama|llama> <model>     effective settings for a model (defaults + stored)
     \\  aimgr agent settings                        all stored per-model settings
-    \\  aimgr agent set <ollama> <model> key=value...
+    \\  aimgr agent set <ollama|llama> <model> key=value...
     \\        keys: level=  dirs=/a,/b  steps=N  timeout=S  output_kb=N  allow=cmd,cmd  sandbox=  root=true|false
-    \\  aimgr agent reset <ollama> <model>          forget a model's stored settings
+    \\  aimgr agent reset <ollama|llama> <model>    forget a model's stored settings
     \\
     \\levels:  off        chat only
     \\         read-only  list_dir and read_file inside the allowed directories
     \\         inspect    + a fixed allowlist of read-only commands (ls, cat, grep, find, git status, ...)
     \\         ask        + any other command or file write, each one approved by you
+    \\For llama, aimgr starts a private llama server for the session (127.0.0.1, free port) and stops it afterwards.
     \\Defaults depend on the model: no tools -> off; under 7B -> read-only; 7B-30B -> inspect; 30B+ -> ask.
     \\
 ;
@@ -44,12 +48,21 @@ const Effective = struct {
     has_tools: bool,
 };
 
-fn effective(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, id: []const u8) !Effective {
-    const info = modelinfo.fetchOllama(arena, gpa, io, id);
-    const has_tools = if (info) |i| i.hasCap("tools") else false;
-    const base: policy.Settings = .{ .level = policy.defaultLevel(has_tools, if (info) |i| i.paramsB() else null) };
+fn catalogParams(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, kind: backend.Kind, id: []const u8) ?f64 {
+    const l = catalog_io.loadAll(arena, gpa, io, env) catch return null;
+    if (l.cat.find(kind, id)) |e| if (e.params_b) |p| return p;
+    return hardware.parseParamsB(id);
+}
+
+fn effective(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, kind: backend.Kind, id: []const u8) !Effective {
+    // ollama reports capabilities and size itself; llama's tool support can only be checked once its
+    // server is running (see llama_server.supportsTools), so it is assumed here and verified at start.
+    const info: ?modelinfo.Info = if (kind == .ollama) modelinfo.fetchOllama(arena, gpa, io, id) else null;
+    const has_tools = if (kind == .llama) true else (if (info) |i| i.hasCap("tools") else false);
+    const params: ?f64 = if (info) |i| i.paramsB() else catalogParams(arena, gpa, io, env, kind, id);
+    const base: policy.Settings = .{ .level = policy.defaultLevel(has_tools, params) };
     const entries = try sources_io.loadAgents(arena, gpa, io, env);
-    const idx = settings.find(entries, .ollama, id);
+    const idx = settings.find(entries, kind, id);
     const stored: ?settings.Entry = if (idx) |i| entries[i] else null;
     return .{ .s = settings.apply(base, stored), .info = info, .stored = stored, .has_tools = has_tools };
 }
@@ -80,20 +93,21 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     }
     if (std.mem.eql(u8, sub, "show") or std.mem.eql(u8, sub, "set") or std.mem.eql(u8, sub, "reset")) {
         if (args.len < 3) return fail(err, usage);
-        const kind = std.meta.stringToEnum(backend.Kind, args[1]) orelse return fail(err, "backend must be 'ollama'");
-        if (kind != .ollama) return fail(err, "agent mode currently supports ollama only (llama server support is planned)");
+        const kind = std.meta.stringToEnum(backend.Kind, args[1]) orelse return fail(err, "backend must be 'ollama' or 'llama'");
         const id = args[2];
         if (std.mem.eql(u8, sub, "show")) {
-            const eff = try effective(arena, gpa, io, env, id);
-            try out.print("agent settings for ollama {s}\n", .{id});
-            if (eff.info) |i| try out.print("  reported by ollama: tools={s}, parameters={s}\n", .{ if (eff.has_tools) "yes" else "no", i.parameters orelse "?" }) else try out.writeAll("  (ollama could not describe this model: is it installed and the daemon running?)\n");
+            const eff = try effective(arena, gpa, io, env, kind, id);
+            try out.print("agent settings for {s} {s}\n", .{ kind.name(), id });
+            if (kind == .llama) {
+                try out.writeAll("  tool support: checked from the chat template when the llama server starts\n");
+            } else if (eff.info) |i| try out.print("  reported by ollama: tools={s}, parameters={s}\n", .{ if (eff.has_tools) "yes" else "no", i.parameters orelse "?" }) else try out.writeAll("  (ollama could not describe this model: is it installed and the daemon running?)\n");
             try printSettings(out, eff.s);
             try out.print("  source:         {s}\n", .{if (eff.stored != null) "defaults + your stored settings" else "defaults for this model (nothing stored)"});
             return 0;
         }
         var entries: std.ArrayList(settings.Entry) = .empty;
         try entries.appendSlice(arena, try sources_io.loadAgents(arena, gpa, io, env));
-        const idx = settings.find(entries.items, .ollama, id);
+        const idx = settings.find(entries.items, kind, id);
         if (std.mem.eql(u8, sub, "reset")) {
             if (idx) |i| _ = entries.orderedRemove(i) else {
                 try out.writeAll("nothing stored for that model\n");
@@ -104,7 +118,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
             return 0;
         }
         if (args.len < 4) return fail(err, usage);
-        var e: settings.Entry = if (idx) |i| entries.items[i] else .{ .backend = .ollama, .id = try arena.dupe(u8, id) };
+        var e: settings.Entry = if (idx) |i| entries.items[i] else .{ .backend = kind, .id = try arena.dupe(u8, id) };
         for (args[3..]) |kv| {
             settings.setKey(arena, &e, kv) catch |er| {
                 try err.print("aimgr: '{s}': {s}\n", .{ kv, switch (er) {
@@ -117,8 +131,8 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         }
         if (idx) |i| entries.items[i] = e else try entries.append(arena, e);
         try sources_io.saveAgents(arena, gpa, io, env, entries.items);
-        const eff = try effective(arena, gpa, io, env, id);
-        try out.print("saved. effective settings for ollama {s}:\n", .{id});
+        const eff = try effective(arena, gpa, io, env, kind, id);
+        try out.print("saved. effective settings for {s} {s}:\n", .{ kind.name(), id });
         try printSettings(out, eff.s);
         if (eff.s.level == .ask) try out.writeAll("note: at level 'ask' every command that is not a known read-only one, and every file write, still needs your approval each time.\n");
         if (eff.s.allow_root) try out.writeAll("note: root commands may now be requested; each still needs your explicit approval and will show a warning.\n");
@@ -128,7 +142,6 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     // ---- run a session ----
     if (args.len < 2) return fail(err, usage);
     const kind = std.meta.stringToEnum(backend.Kind, args[0]) orelse return fail(err, usage);
-    if (kind != .ollama) return fail(err, "agent mode currently supports ollama only (llama server support is planned)");
     const id = args[1];
     var dirs_cli: std.ArrayList([]const u8) = .empty;
     var level_cli: ?policy.Level = null;
@@ -155,16 +168,19 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     }
 
     // Preconditions, each with an actionable message.
-    for (report.reports) |r| if (r.kind == .ollama and r.probe != .available) return fail(err, "ollama is unavailable");
-    if (!inventoryHas(report, id)) {
-        try err.print("aimgr: '{s}' is not installed in ollama (exact id required; see 'aimgr list')\n", .{id});
+    for (report.reports) |r| if (r.kind == kind and r.probe != .available) {
+        try err.print("aimgr: {s} is unavailable\n", .{kind.name()});
+        return 1;
+    };
+    if (!inventoryHas(report, kind, id)) {
+        try err.print("aimgr: '{s}' is not installed in {s} (exact id required; see 'aimgr list')\n", .{ id, kind.name() });
         return 1;
     }
-    if (catalog_io.loadAll(arena, gpa, io, env) catch null) |l| if (l.cat.find(.ollama, id)) |ent| if (ent.access == .cloud) {
+    if (catalog_io.loadAll(arena, gpa, io, env) catch null) |l| if (l.cat.find(kind, id)) |ent| if (ent.access == .cloud) {
         try err.writeAll("aimgr: that is a cloud model: it runs on a remote service, so aimgr will not give it access to this computer\n");
         return 1;
     };
-    var eff = try effective(arena, gpa, io, env, id);
+    var eff = try effective(arena, gpa, io, env, kind, id);
     if (!eff.has_tools) {
         try err.print("aimgr: ollama does not report tool support for '{s}', so it cannot use tools. Pick a model tagged [tools] in 'aimgr list'.\n", .{id});
         return 1;
@@ -174,7 +190,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     if (timeout_cli) |n| eff.s.timeout_s = @max(1, @min(n, 600));
     if (sandbox_cli) |sb| eff.s.sandbox = sb;
     if (eff.s.level == .off) {
-        try err.print("aimgr: the autonomy level for '{s}' is 'off'. Raise it with: aimgr agent set ollama {s} level=read-only\n", .{ id, id });
+        try err.print("aimgr: the autonomy level for '{s}' is 'off'. Raise it with: aimgr agent set {s} {s} level=read-only\n", .{ id, kind.name(), id });
         return 1;
     }
 
@@ -182,7 +198,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     var dirs: std.ArrayList([]const u8) = .empty;
     const wanted: []const []const u8 = if (dirs_cli.items.len > 0) dirs_cli.items else eff.s.dirs;
     if (wanted.len == 0) {
-        try err.writeAll("aimgr: no directory given. Use --dir PATH (the model can only look inside it), or store one with: aimgr agent set ollama <model> dirs=/path\n");
+        try err.writeAll("aimgr: no directory given. Use --dir PATH (the model can only look inside it), or store one with: aimgr agent set <backend> <model> dirs=/path\n");
         return 2;
     }
     for (wanted) |d| {
@@ -203,7 +219,7 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     }
     eff.s.dirs = dirs.items;
 
-    if (!netstat.isListening(gpa, io, 11434)) {
+    if (kind == .ollama and !netstat.isListening(gpa, io, 11434)) {
         try err.writeAll("aimgr: the ollama daemon is not running on 127.0.0.1:11434. Start it with: aimgr serve ollama\n");
         return 1;
     }
@@ -222,14 +238,35 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     var input: run.Input = undefined;
     input.init(io);
     const audit = try config.statePath(arena, env, "agent-audit.log");
-    const renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434" };
+    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434" };
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
+
+    if (kind == .ollama) return run.session(renv, id, eff.s, sandbox_on);
+
+    // llama: start a private server for this session, verify tool support, always stop it afterwards.
+    const log_dir = try config.statePath(arena, env, "logs");
+    var srv = llama_server.start(arena, gpa, io, env, id, 8192, log_dir, out, 300) catch |e| {
+        try err.print("aimgr: {s}", .{llama_server.startErrorText(e)});
+        if (e == error.ExitedEarly or e == error.Timeout) try err.print(" (see the llama log in {s})", .{log_dir orelse "the state directory"});
+        try err.writeAll("\n");
+        return 1;
+    };
+    defer srv.stop(gpa, io);
+    switch (llama_server.supportsTools(arena, gpa, io, srv.port) orelse false) {
+        true => {},
+        false => {
+            try err.print("aimgr: this model's chat template does not support tool calls, so it cannot be used in agent mode. Pick a model tagged [tools] in 'aimgr list'.\n", .{});
+            return 1;
+        },
+    }
+    renv.api = .openai;
+    renv.host_port = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{srv.port});
     return run.session(renv, id, eff.s, sandbox_on);
 }
 
-fn inventoryHas(report: inventory.Inventory, id: []const u8) bool {
+fn inventoryHas(report: inventory.Inventory, kind: backend.Kind, id: []const u8) bool {
     for (report.reports) |r| {
-        if (r.kind != .ollama) continue;
+        if (r.kind != kind) continue;
         for (r.models orelse &.{}) |m| if (std.mem.eql(u8, m.id, id)) return true;
     }
     return false;

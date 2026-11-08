@@ -51,3 +51,26 @@ test "postJson refuses non-loopback plain http" {
     try std.testing.expectError(error.NetworkFailed, postJson(std.testing.allocator, std.testing.io, "http://192.168.1.5:11434/api/chat", "{}", 10));
     try std.testing.expectError(error.NetworkFailed, postJson(std.testing.allocator, std.testing.io, "ftp://127.0.0.1:1/", "{}", 10));
 }
+
+/// GET from the loopback interface only (health / props of a server aimgr started itself).
+pub fn getLocal(gpa: std.mem.Allocator, io: std.Io, url: []const u8, max_bytes: usize) Error![]u8 {
+    const loopback = std.mem.startsWith(u8, url, "http://127.0.0.1:") or std.mem.startsWith(u8, url, "http://localhost:") or std.mem.startsWith(u8, url, "http://[::1]:");
+    if (!loopback) return error.NetworkFailed;
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &out.writer,
+        .extra_headers = &.{.{ .name = "user-agent", .value = "aimgr (local model manager)" }},
+    }) catch return error.NetworkFailed;
+    if (res.status != .ok) return error.BadStatus;
+    if (out.written().len > max_bytes) return error.TooLarge;
+    return gpa.dupe(u8, out.written());
+}
+
+test "getLocal refuses anything but loopback" {
+    try std.testing.expectError(error.NetworkFailed, getLocal(std.testing.allocator, std.testing.io, "http://example.org/x", 10));
+    try std.testing.expectError(error.NetworkFailed, getLocal(std.testing.allocator, std.testing.io, "https://127.0.0.1:1/", 10));
+}

@@ -75,7 +75,7 @@ pub fn runChat(e: Env, plan: launcher.Plan) !u8 {
     };
 }
 
-fn pidAlive(gpa: std.mem.Allocator, io: std.Io, pid: i32) bool {
+pub fn pidAlive(gpa: std.mem.Allocator, io: std.Io, pid: i32) bool {
     var buf: [64]u8 = undefined;
     const path = std.fmt.bufPrint(&buf, "/proc/{d}/stat", .{pid}) catch return false;
     const text = netstat.readProc(gpa, io, path, 4096) catch return false;

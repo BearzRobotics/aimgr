@@ -30,8 +30,9 @@ pub const Env = struct {
     input: *Input,
     /// Where the JSON-lines audit log goes (null = no log).
     audit_path: ?[]const u8,
-    /// Ollama daemon, "127.0.0.1:11434".
+    /// Server address, e.g. "127.0.0.1:11434" (ollama) or "127.0.0.1:9931" (llama-server).
     host_port: []const u8,
+    api: chat.Api = .ollama,
 };
 
 const Audit = struct {
@@ -105,6 +106,17 @@ fn getInt(obj: std.json.ObjectMap, key: []const u8) ?u64 {
     };
 }
 
+/// Heuristic for models that print `<tool>{...}</tool>` or a JSON call in prose instead of a real
+/// tool call. aimgr never executes text like this: it only reports it.
+pub fn looksLikeTextToolCall(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "<tool") != null or std.mem.indexOf(u8, text, "<function") != null) return true;
+    for ([_][]const u8{ "list_dir", "read_file", "run_command", "write_file" }) |name| {
+        const quoted = std.mem.indexOf(u8, text, name) orelse continue;
+        if (std.mem.indexOf(u8, text[0..quoted], "\"name\"") != null or std.mem.indexOf(u8, text[0..quoted], "\"function\"") != null) return true;
+    }
+    return false;
+}
+
 fn shellQuote(arena: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     for (argv, 0..) |a, i| {
@@ -148,7 +160,7 @@ fn handleCall(e: Env, arena: std.mem.Allocator, s: policy.Settings, sandbox_on: 
             const path = getStr(args, "path") orelse return denied(arena, "missing 'path'");
             const norm = tools.resolve(arena, e.io, s, path, true) catch |er| return denied(arena, switch (er) {
                 error.OutsideDirs => "a symlink leads outside the allowed directories",
-                error.NotFound => "no such file or directory",
+                error.NotFound => try std.fmt.allocPrint(arena, "no such file or directory: '{s}'. Absolute paths start with '/'; other paths are relative to {s}", .{ path, if (s.dirs.len > 0) s.dirs[0] else "/" }),
                 error.BadPath => "invalid path",
                 error.OutOfMemory => return error.OutOfMemory,
             });
@@ -271,8 +283,8 @@ pub fn session(e: Env, model: []const u8, s: policy.Settings, sandbox_on: bool) 
             steps += 1;
             _ = turn.reset(.retain_capacity);
             const ta = turn.allocator();
-            const body = try chat.requestBody(ta, model, msgs.items, schemas, 8192);
-            const reply = chat.send(ta, e.gpa, e.io, e.host_port, body) catch |er| {
+            const body = try chat.requestBody(ta, e.api, model, msgs.items, schemas, 8192);
+            const reply = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body) catch |er| {
                 switch (er) {
                     error.ApiError => try e.err.print("aimgr: ollama said: {s}\n", .{chat.last_error}),
                     error.Unreachable => try e.err.print("aimgr: cannot reach ollama at {s}\n", .{e.host_port}),
@@ -285,18 +297,21 @@ pub fn session(e: Env, model: []const u8, s: policy.Settings, sandbox_on: bool) 
 
             // Keep the assistant turn in history.
             var kept_calls: std.ArrayList(chat.Call) = .empty;
-            for (reply.calls) |c| try kept_calls.append(ha, .{ .name = try ha.dupe(u8, c.name), .args_json = try ha.dupe(u8, c.args_json) });
+            for (reply.calls) |c| try kept_calls.append(ha, .{ .id = try ha.dupe(u8, c.id), .name = try ha.dupe(u8, c.name), .args_json = try ha.dupe(u8, c.args_json) });
             try msgs.append(ha, .{ .role = .assistant, .content = try ha.dupe(u8, reply.content), .calls = try kept_calls.toOwnedSlice(ha) });
 
             if (reply.content.len > 0) try e.out.print("\nassistant> {s}\n", .{reply.content});
-            if (reply.calls.len == 0) break;
+            if (reply.calls.len == 0) {
+                if (looksLikeTextToolCall(reply.content)) try e.out.writeAll("\n  note: that reply describes a tool call as plain text instead of using the tool interface, so NOTHING was run. This model is unreliable at tool use; try one tagged [tools] that handles it well (for example gpt-oss).\n");
+                break;
+            }
 
             for (reply.calls) |c| {
                 const o = try handleCall(e, ta, s, sandbox_on, c);
                 const capped = try tools.truncate(ta, o.text, @as(usize, s.max_output_kb) * 1024);
                 audit.record(ta, model, c.name, c.args_json, o.decision, o.reason, capped.len);
                 if (std.mem.startsWith(u8, capped, "DENIED:")) try e.out.print("  -> {s}\n", .{capped});
-                try msgs.append(ha, .{ .role = .tool, .content = try ha.dupe(u8, capped), .tool_name = try ha.dupe(u8, c.name) });
+                try msgs.append(ha, .{ .role = .tool, .content = try ha.dupe(u8, capped), .tool_name = try ha.dupe(u8, c.name), .tool_call_id = try ha.dupe(u8, c.id) });
             }
             try e.out.flush();
         }
@@ -307,4 +322,11 @@ test "shellQuote shows exactly what will run" {
     var a = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer a.deinit();
     try std.testing.expectEqualStrings("grep -rn 'two words' ./x", try shellQuote(a.allocator(), &.{ "grep", "-rn", "two words", "./x" }));
+}
+
+test "text-form tool calls are recognized (and only reported)" {
+    try std.testing.expect(looksLikeTextToolCall("I'll use list_dir.\n```xml\n<tool>\n{\"name\": \"list_dir\"}\n</tool>"));
+    try std.testing.expect(looksLikeTextToolCall("{\"name\": \"run_command\", \"arguments\": {}}"));
+    try std.testing.expect(!looksLikeTextToolCall("There are 11 entries in the folder."));
+    try std.testing.expect(!looksLikeTextToolCall("You can read_file contents with a tool, if you like."));
 }

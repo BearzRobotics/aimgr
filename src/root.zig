@@ -31,6 +31,7 @@ pub const agent_chat = @import("agent/chat.zig");
 pub const agent_tools = @import("agent/tools.zig");
 pub const agent_settings = @import("agent/settings.zig");
 pub const agent_run = @import("agent/run.zig");
+pub const agent_llama = @import("agent/llama_server.zig");
 pub const agent_cmd = @import("agent_cmd.zig");
 pub const sources_io = @import("sources_io.zig");
 pub const sources_cmd = @import("sources_cmd.zig");

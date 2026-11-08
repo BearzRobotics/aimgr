@@ -1,6 +1,6 @@
 # 0010: Agent mode (tool use) and the exception to "never auto-execute"
 
-Status: accepted and implemented for Ollama (2026-11-08); llama support is a follow-up.
+Status: accepted and implemented for Ollama and llama (2026-11-08).
 
 ## Why
 Running `ollama run` through aimgr gives a chat that cannot look at the machine ("I can't access
@@ -31,8 +31,9 @@ run without a prompt; everything else needs per-action approval or is denied.
 - **Limits:** per-command timeout, output cap (default 64 KiB returned to the model), file read cap,
   step cap. Optional `bwrap` sandbox (read-only bind of allowed dirs, no network) when installed.
 - **Audit log:** JSON lines in `$XDG_STATE_HOME/aimgr/agent-audit.log`.
-- **API:** Ollama `/api/chat` with `tools` (non-streaming) over loopback HTTP. llama-server
-  (OpenAI-style tools) is a follow-up. Network model downloads are not involved.
+- **API:** Ollama `/api/chat` with `tools` (non-streaming) and llama-server's OpenAI-style
+  `/v1/chat/completions` (arguments are JSON strings, results are `role: tool` with `tool_call_id`), both over
+  loopback HTTP only (`http.postJson` / `http.getLocal` refuse anything else). Network model downloads are not involved.
 
 ## Not goals
 No autonomous background agents, no web access tool, no persistent memory, no editing outside the
@@ -72,8 +73,19 @@ audit log lines recorded each. TUI `g` started a session and returned to the TUI
 including `..`, sibling-directory prefixes, secret names, shell metacharacters, find/git/tail flags, sudo,
 interpreters and wrappers.
 
+## llama backend (added 2026-11-08)
+- `agent_cmd` starts `llama serve --offline -hf <id> -c 8192 --jinja` on 127.0.0.1:<first free port in 19900-19999>,
+  waits for `/health`, reads `/props` `chat_template_caps.supports_tools` (refuses if false/unreadable), then runs the same
+  loop over the OpenAI dialect. The server log goes to `$XDG_STATE_HOME/aimgr/logs/agent-llama-<port>.log`.
+- Lifecycle: normal exit -> SIGTERM then wait (KILL after ~15 s); aimgr killed -> the kernel sends SIGTERM to the server
+  (setpriv `--pdeathsig`). Verified: `kill -9` on aimgr leaves no listener. Without setpriv aimgr warns.
+- Tool support is a property of the model *and* its chat template. Verified: gpt-oss-20b makes real tool calls (list_dir,
+  sandboxed grep) and recovers from denials; Qwen2.5-Coder-14B instead prints `<tool>{...}</tool>` as text, which aimgr
+  reports ("nothing was run") and never executes; Qwen3.5-0.8B calls tools but mangles paths (policy and the step cap contained it).
+- Settings can be stored and edited for llama models with `aimgr agent set llama <id> ...`; the Settings tab only lists
+  Ollama models for now because llama's capability is unknown until its server runs.
+
 ## Known limits
-- Ollama only; llama-server tool calling is not implemented.
 - Small models call tools badly or miscount (a 12B model misreported a folder count after reading the listing
   correctly): the policy keeps that harmless, but answers still need checking.
 - Without bubblewrap, an approved command runs with the user's full privileges.

@@ -652,17 +652,19 @@ fn selectNewest(app: *App, kind: jobs_mod.Kind) void {
 
 // ---- agent mode ---------------------------------------------------------
 
-/// `g`: let the selected tool-capable Ollama model look at a directory (see ai/SPEC.md, "Agent mode").
+/// `g`: let the selected installed model look at a directory (see ai/SPEC.md, "Agent mode").
+/// Ollama models need `ollama show` to report tools; llama models are checked when their server starts.
 fn beginAgent(app: *App) void {
     const row = app.currentRow() orelse return app.setMessage(true, "no model selected", .{});
-    if (row.model.backend != .ollama) return app.setMessage(true, "agent mode currently supports ollama models only", .{});
     if (!row.installed) return app.setMessage(true, "only installed models can be used", .{});
     if (row.access == .cloud) return app.setMessage(true, "cloud models are not given access to this computer", .{});
-    const info = row.info orelse return app.setMessage(true, "ollama did not describe this model, so tool support is unknown", .{});
-    if (!info.hasCap("tools")) return app.setMessage(true, "ollama reports no tool support for this model; pick one tagged [tools]", .{});
+    if (row.model.backend == .ollama) {
+        const info = row.info orelse return app.setMessage(true, "ollama did not describe this model, so tool support is unknown", .{});
+        if (!info.hasCap("tools")) return app.setMessage(true, "ollama reports no tool support for this model; pick one tagged [tools]", .{});
+    }
     // A stored directory means no question: the settings are the user's.
     const entries = sources_io.loadAgents(app.frame.allocator(), app.gpa, app.io, app.environ) catch &.{};
-    if (agent_settings.find(entries, .ollama, row.model.id)) |i| if (entries[i].dirs != null) return runAgent(app, row.model.id, null);
+    if (agent_settings.find(entries, row.model.backend, row.model.id)) |i| if (entries[i].dirs != null) return runAgent(app, row.model.backend, row.model.id, null);
     app.prompt_is_agent = true;
     app.prompt_is_search = false;
     app.prompt = "Directory the model may look at (absolute path; it cannot leave it):";
@@ -676,16 +678,16 @@ fn submitAgent(app: *App) void {
     if (dir.len == 0) return app.setMessage(false, "agent cancelled (no directory entered)", .{});
     if (dir[0] != '/') return app.setMessage(true, "the directory must be an absolute path", .{});
     const row = app.currentRow() orelse return;
-    runAgent(app, row.model.id, dir);
+    runAgent(app, row.model.backend, row.model.id, dir);
 }
 
 /// Leave the TUI, run `aimgr agent ...` on the real terminal (it prints every tool call and asks before
 /// anything beyond read-only), then come back.
-fn runAgent(app: *App, id: []const u8, dir: ?[]const u8) void {
+fn runAgent(app: *App, be: backend.Kind, id: []const u8, dir: ?[]const u8) void {
     const fa = app.frame.allocator();
     const exe = std.process.executablePathAlloc(app.io, fa) catch return app.setMessage(true, "cannot locate the aimgr executable", .{});
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(fa, &.{ exe, "agent", "ollama", id }) catch return;
+    argv.appendSlice(fa, &.{ exe, "agent", be.name(), id }) catch return;
     if (dir) |d| argv.appendSlice(fa, &.{ "--dir", d }) catch return;
     term.suspendTerm();
     var ob: [1024]u8 = undefined;
