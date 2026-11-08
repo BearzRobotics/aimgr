@@ -24,6 +24,29 @@ const win = if (is_windows) struct {
     extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *CSBI) callconv(.winapi) c_int;
     extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn CreateJobObjectW(attrs: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *const anyopaque, len: u32) callconv(.winapi) c_int;
+    extern "kernel32" fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) callconv(.winapi) c_int;
+    const BASIC_LIMIT = extern struct {
+        per_process_user_time: i64 = 0,
+        per_job_user_time: i64 = 0,
+        limit_flags: u32 = 0,
+        min_ws: usize = 0,
+        max_ws: usize = 0,
+        active_process_limit: u32 = 0,
+        affinity: usize = 0,
+        priority_class: u32 = 0,
+        scheduling_class: u32 = 0,
+    };
+    const IO_COUNTERS = extern struct { a: u64 = 0, b: u64 = 0, c: u64 = 0, d: u64 = 0, e: u64 = 0, f: u64 = 0 };
+    const EXTENDED_LIMIT = extern struct {
+        basic: BASIC_LIMIT = .{},
+        io: IO_COUNTERS = .{},
+        process_memory_limit: usize = 0,
+        job_memory_limit: usize = 0,
+        peak_process_memory_used: usize = 0,
+        peak_job_memory_used: usize = 0,
+    };
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: [*:0]const u16) callconv(.winapi) c_int;
     extern "kernel32" fn SetConsoleCtrlHandler(cb: ?*const fn (c_uint) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
 } else struct {};
@@ -159,4 +182,16 @@ pub fn writeStdoutRaw(bytes: []const u8) void {
         return;
     }
     _ = std.posix.system.write(1, bytes.ptr, bytes.len);
+}
+
+/// Make `pid` end when aimgr ends, however aimgr ends (Linux does this with setpriv --pdeathsig at spawn time).
+/// Windows: the child joins a job object that kills its processes when the job's last handle closes; aimgr
+/// keeps that handle open for its whole life, so the handle closes exactly when aimgr exits or is killed.
+pub fn killWithParent(pid: Pid) void {
+    if (!is_windows) return;
+    const job = win.CreateJobObjectW(null, null) orelse return;
+    var info: win.EXTENDED_LIMIT = .{};
+    info.basic.limit_flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    _ = win.SetInformationJobObject(job, 9, &info, @sizeOf(win.EXTENDED_LIMIT)); // JobObjectExtendedLimitInformation
+    _ = win.AssignProcessToJobObject(job, pid);
 }

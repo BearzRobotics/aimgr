@@ -97,9 +97,13 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
         const body = try chat.requestBody(ta, e.api, e.model, msgs.items, schemas, 8192);
         try e.out.flush();
         activity.set("thinking");
-        const sent = chat.send(ta, e.gpa, e.io, e.api, e.host_port, body);
+        const sent = sendCancellable(e, ta, body);
         activity.clear();
         const reply = sent catch |er| {
+            if (er == error.Interrupted) {
+                try e.out.print("{s}  \x1b[33m⏹ interrupted\x1b[0m (the model's reply was dropped)\n", .{indent});
+                return last;
+            }
             switch (er) {
                 error.ApiError => try e.err.print("aimgr: the model server said: {s}\n", .{chat.last_error}),
                 error.Unreachable => try e.err.print("aimgr: cannot reach the model server at {s}\n", .{e.host_port}),
@@ -123,6 +127,11 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
         }
 
         for (reply.calls) |c| {
+            if (activity.cancelled()) {
+                // Every call needs a result in the history; the rest are skipped.
+                try msgs.append(ha, .{ .role = .tool, .content = "interrupted by the user before this ran", .tool_name = try ha.dupe(u8, c.name), .tool_call_id = try ha.dupe(u8, c.id) });
+                continue;
+            }
             const o = try calls.handleCall(e, st, ta, s, sandbox_on, c);
             const capped = try tools.truncate(ta, o.text, @as(usize, s.max_output_kb) * 1024);
             audit.record(ta, e.model, c.name, c.args_json, o.decision, o.reason, capped.len);
@@ -130,7 +139,71 @@ fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllo
             try msgs.append(ha, .{ .role = .tool, .content = try ha.dupe(u8, capped), .tool_name = try ha.dupe(u8, c.name), .tool_call_id = try ha.dupe(u8, c.id) });
         }
         try e.out.flush();
+        if (activity.cancelled()) {
+            try e.out.print("{s}  \x1b[33m⏹ interrupted\x1b[0m\n", .{indent});
+            return last;
+        }
     }
+}
+
+/// A model request that Esc can abandon (full-screen sessions). The request runs on a helper thread with its
+/// own memory; on Esc the session stops waiting at once and the helper frees everything when the server
+/// answers (the server may finish generating that reply in the background).
+const Pending = struct {
+    arena: std.heap.ArenaAllocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    api: chat.Api,
+    host_port: []const u8 = "",
+    body: []const u8 = "",
+    result: anyerror!chat.Reply = error.Unreachable,
+    /// 0 running, 1 done, 2 abandoned
+    state: std.atomic.Value(u8) = .init(0),
+
+    fn run(p: *Pending) void {
+        p.result = chat.send(p.arena.allocator(), p.gpa, p.io, p.api, p.host_port, p.body);
+        if (p.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            const gpa = p.gpa;
+            p.arena.deinit();
+            gpa.destroy(p);
+        }
+    }
+};
+
+fn sendCancellable(e: Env, ta: std.mem.Allocator, body: []const u8) !chat.Reply {
+    if (e.ui == null) return chat.send(ta, e.gpa, e.io, e.api, e.host_port, body);
+    const p = try e.gpa.create(Pending);
+    p.* = .{ .arena = .init(e.gpa), .gpa = e.gpa, .io = e.io, .api = e.api };
+    const a = p.arena.allocator();
+    p.host_port = try a.dupe(u8, e.host_port);
+    p.body = try a.dupe(u8, body);
+    const t = std.Thread.spawn(.{}, Pending.run, .{p}) catch {
+        p.arena.deinit();
+        e.gpa.destroy(p);
+        return chat.send(ta, e.gpa, e.io, e.api, e.host_port, body);
+    };
+    t.detach();
+    while (p.state.load(.acquire) != 1) {
+        if (activity.cancelled()) {
+            // The helper owns `p` from here on (unless it finished in the same instant).
+            if (p.state.cmpxchgStrong(0, 2, .acq_rel, .acquire) == null) return error.Interrupted;
+            break;
+        }
+        e.io.sleep(.fromMilliseconds(20), .awake) catch {};
+    }
+    defer {
+        p.arena.deinit();
+        e.gpa.destroy(p);
+    }
+    const r = try p.result;
+    const cs = try ta.alloc(chat.Call, r.calls.len);
+    for (r.calls, 0..) |c, i| {
+        cs[i] = c;
+        cs[i].id = try ta.dupe(u8, c.id);
+        cs[i].name = try ta.dupe(u8, c.name);
+        cs[i].args_json = try ta.dupe(u8, c.args_json);
+    }
+    return .{ .content = try ta.dupe(u8, r.content), .calls = cs };
 }
 
 /// Run `task` in a fresh context as a sub-agent: same model and directories, never more autonomy than
@@ -171,6 +244,7 @@ pub fn subAgent(e: Env, parent: *State, ps: policy.Settings, sandbox_on: bool, t
 /// One unattended request (a scheduled task): no one can approve or answer, so the caller must have
 /// capped `s` (level read-only/inspect, no shell/web). Returns the model's final text (owned by `out`).
 pub fn runOnce(e0: Env, model: []const u8, s: policy.Settings, sandbox_on: bool, task: []const u8, out: std.mem.Allocator) !?[]const u8 {
+    activity.useIo(e0.io);
     var e = e0;
     e.model = model;
     var hist_arena = std.heap.ArenaAllocator.init(e.gpa);
@@ -385,6 +459,7 @@ fn compact(e: Env, ha: std.mem.Allocator, turn: *std.heap.ArenaAllocator, msgs: 
 
 /// Interactive session. Returns the process exit code.
 pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bool) !u8 {
+    activity.useIo(e0.io);
     var s = s_in;
     var e = e0;
     e.model = model;
@@ -561,6 +636,7 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
         st.spawned = 0;
         try msgs.append(ha, .{ .role = .user, .content = try ha.dupe(u8, user) });
         const before = msgs.items.len;
+        activity.resetCancel();
         const res = try converse(e, &st, ha, &turn, &msgs, s, sandbox_on, &audit, "");
         if (res == null) msgs.shrinkRetainingCapacity(before - 1); // drop the unanswered user message
     }

@@ -43,6 +43,9 @@ pub const Error = error{ ApiError, BadReply, Unreachable, OutOfMemory };
 /// Message of the last API error (valid until the next call).
 pub var last_error: []const u8 = "";
 
+/// Upper bound for one reply (thinking included), so a looping model ends instead of running for hours.
+pub const max_reply_tokens: u32 = 4096;
+
 pub fn requestBody(arena: std.mem.Allocator, api: Api, model: []const u8, msgs: []const Msg, tools_json: []const u8, num_ctx: u32) ![]u8 {
     if (api == .openai) return requestBodyOpenai(arena, model, msgs, tools_json);
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -56,6 +59,9 @@ pub fn requestBody(arena: std.mem.Allocator, api: Api, model: []const u8, msgs: 
     try s.beginObject();
     try s.objectField("num_ctx");
     try s.write(num_ctx);
+    // A model that never stops (small "thinking" models can loop) must not generate forever.
+    try s.objectField("num_predict");
+    try s.write(max_reply_tokens);
     try s.endObject();
     try s.objectField("messages");
     try s.beginArray();
@@ -107,6 +113,8 @@ fn requestBodyOpenai(arena: std.mem.Allocator, model: []const u8, msgs: []const 
     try s.beginObject();
     try s.objectField("model");
     try s.write(model);
+    try s.objectField("max_tokens");
+    try s.write(max_reply_tokens);
     try s.objectField("stream");
     try s.write(false);
     try s.objectField("messages");
@@ -318,4 +326,14 @@ test "openai reply: real llama-server shape, plain text, errors" {
     try std.testing.expectError(error.ApiError, parseReply(a.allocator(), .openai, "{\"error\":{\"message\":\"model does not support tools\",\"code\":500}}"));
     try std.testing.expect(std.mem.indexOf(u8, last_error, "support tools") != null);
     try std.testing.expectError(error.BadReply, parseReply(a.allocator(), .openai, "{\"choices\":[]}"));
+}
+
+test "every request caps the reply length" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const msgs = [_]Msg{.{ .role = .user, .content = "hi" }};
+    const o = try requestBody(a.allocator(), .ollama, "m", &msgs, "", 8192);
+    try std.testing.expect(std.mem.indexOf(u8, o, "\"num_predict\":4096") != null);
+    const p = try requestBody(a.allocator(), .openai, "m", &msgs, "", 8192);
+    try std.testing.expect(std.mem.indexOf(u8, p, "\"max_tokens\":4096") != null);
 }

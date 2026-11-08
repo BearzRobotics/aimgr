@@ -305,6 +305,16 @@ pub const Ui = struct {
             self.vx.queueRefresh();
             return true;
         }
+        // Esc while the model or a tool works: interrupt that request (the session goes on).
+        if (k.codepoint == vaxis.Key.escape) {
+            self.lock.lock();
+            const busy = !self.want_line and !self.menu_on;
+            self.lock.unlock();
+            if (busy) {
+                activity.requestCancel();
+                return true;
+            }
+        }
         // Scrolling the transcript.
         switch (k.codepoint) {
             vaxis.Key.page_up => {
@@ -566,8 +576,10 @@ pub const Ui = struct {
             const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
             putText(win, y, 2, frames[(self.spinner / 3) % frames.len], .{ .fg = .{ .index = 6 } });
             putText(win, y, 4, act, .{ .dim = true });
+            const tail: []const u8 = if (activity.cancelled()) "  interrupting…" else "  · Esc interrupts";
+            putText(win, y, 4 + (std.unicode.utf8CountCodepoints(act) catch act.len), tail, .{ .dim = true });
         } else {
-            const hint: []const u8 = if (menu_on) "answer the question above" else if (waiting) "Enter send · Shift+Enter new line · PgUp/PgDn scroll · /help · Ctrl-C quit" else "working… (Enter queues your message)";
+            const hint: []const u8 = if (menu_on) "answer the question above" else if (waiting) "Enter send · Shift+Enter new line · PgUp/PgDn scroll · /help · Ctrl-C quit" else "working… Esc interrupts · Enter queues your message";
             const q = if (queued > 0 and !waiting) std.fmt.allocPrint(a, "{s}   {d} queued", .{ status, queued }) catch status else status;
             putText(win, y, 2, std.fmt.allocPrint(a, "{s}   {s}", .{ q, hint }) catch q, .{ .dim = true });
         }

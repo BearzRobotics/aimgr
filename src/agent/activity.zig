@@ -15,8 +15,9 @@ var files = std.atomic.Value(usize).init(0);
 var row: u16 = 0;
 var cols: u16 = 80;
 var running = std.atomic.Value(bool).init(false);
+var cancel = std.atomic.Value(bool).init(false);
 var thread: ?std.Thread = null;
-var io_global: std.Io = undefined;
+var io_global: ?std.Io = null;
 
 fn acquire() void {
     while (lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
@@ -26,8 +27,9 @@ fn release() void {
     lock.store(false, .release);
 }
 
-fn nowMs(io: std.Io) i64 {
-    return std.Io.Clock.awake.now(io).toMilliseconds();
+fn nowMs(io: ?std.Io) i64 {
+    const i = io orelse return 0;
+    return std.Io.Clock.awake.now(i).toMilliseconds();
 }
 
 /// Start the ticker for a pinned box whose status line is terminal row `status_row`.
@@ -82,6 +84,19 @@ pub fn clear() void {
     label_len = 0;
 }
 
+/// Esc in the session: stop the current request (the model call, a search, OCR) as soon as possible.
+pub fn requestCancel() void {
+    cancel.store(true, .release);
+}
+
+pub fn cancelled() bool {
+    return cancel.load(.acquire);
+}
+
+pub fn resetCancel() void {
+    cancel.store(false, .release);
+}
+
 /// Progress of a walk (files seen so far).
 pub fn count(n: usize) void {
     files.store(n, .monotonic);
@@ -91,7 +106,7 @@ fn tick() void {
     const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
     var i: usize = 0;
     while (running.load(.acquire)) {
-        io_global.sleep(.fromMilliseconds(250), .awake) catch {};
+        if (io_global) |io| io.sleep(.fromMilliseconds(250), .awake) catch {};
         i += 1;
         acquire();
         if (label_len > 0) {

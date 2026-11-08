@@ -334,6 +334,7 @@ fn ocrPdf(arena: std.mem.Allocator, io: std.Io, path: []const u8, n: u32) !Ocr {
     }.lt);
     var out: std.ArrayList(u8) = .empty;
     for (names.items, 1..) |name, page| {
+        if (activity.cancelled()) break;
         const img = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
         const t = process.run(arena, io, &.{ "tesseract", img, "-", "--psm", "3" }, 120, null, 4 * 1024 * 1024);
         if (t.outcome != .exited) continue;
@@ -379,6 +380,10 @@ fn searchDir(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8, query: 
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
         if (st.truncated) return;
+        if (activity.cancelled()) {
+            st.truncated = true;
+            return;
+        }
         if (e.name.len == 0 or e.name[0] == '.' and std.mem.eql(u8, e.name, ".git")) continue;
         const full = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, dir_path, "/"), e.name });
         switch (e.kind) {

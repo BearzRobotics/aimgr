@@ -15,7 +15,10 @@ pub const Input = struct {
     /// Full-screen session: lines come from the input box.
     ui: ?*ui.Ui = null,
 
+    /// Every field is set here: the struct is declared `undefined` by callers.
     pub fn init(self: *Input, io: std.Io) void {
+        self.closed = false;
+        self.ui = null;
         self.reader = std.Io.File.stdin().reader(io, &self.buf);
     }
 

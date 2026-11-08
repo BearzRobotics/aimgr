@@ -33,7 +33,8 @@ rpm, zypper, winget), git and gh. Per-model level, sandbox, shell and web are se
 `zig build -Dtarget=x86_64-windows`, or use the release zip. `aimgr setup-backends` downloads Ollama (official
 release, SHA-256 pinned) into aimgr's own folder; no admin rights needed. The agent uses PowerShell 5.1 by default
 (`pwsh` and `cmd` are options). Windows has no sandbox, so every command the model runs is shown and approved.
-Not on Windows yet: scheduled agent runs, llama.cpp download, abliteration.
+`aimgr setup-backends` also installs llama.cpp (Vulkan build with a GPU, CPU build otherwise). Not on Windows yet:
+scheduled agent runs, abliteration.
 
 Vendored, pinned sources (no network at build time): `vendor/toml-zig`, `vendor/libvaxis`,
 `vendor/uucode`, `vendor/llama-convert`, `vendor/md-zig` (see each `VENDORED.txt`). Design decisions: `docs/decisions/`.

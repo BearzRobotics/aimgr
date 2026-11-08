@@ -53,7 +53,7 @@ pub fn start(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: 
     const have_setpriv = if (std.Io.Dir.cwd().access(io, "/usr/bin/setpriv", .{})) |_| true else |_| false;
     if (have_setpriv) {
         argv.appendSlice(arena, &.{ "/usr/bin/setpriv", "--pdeathsig", "TERM", "--" }) catch return error.OutOfMemory;
-    } else out.writeAll("warning: setpriv not found; if aimgr is killed abruptly the llama server may keep running (stop it manually)\n") catch {};
+    } else if (@import("builtin").os.tag != .windows) out.writeAll("warning: setpriv not found; if aimgr is killed abruptly the llama server may keep running (stop it manually)\n") catch {};
     argv.appendSlice(arena, pl.argv) catch return error.OutOfMemory;
     argv.append(arena, "--jinja") catch return error.OutOfMemory; // chat-template tool calling
 
@@ -78,6 +78,7 @@ pub fn start(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: 
         .stderr = sink,
     }) catch return error.SpawnFailed;
     const pid: platform.Pid = child.id.?;
+    platform.killWithParent(pid); // Windows: no orphaned server if aimgr is killed
     var srv: Server = .{ .child = child, .pid = pid, .port = port, .log_path = log_path };
 
     const url = std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/health", .{port}) catch return error.OutOfMemory;
