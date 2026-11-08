@@ -7,6 +7,8 @@ const process = std.process;
 pub const Input = struct {
     reader: std.Io.File.Reader,
     buf: [4096]u8 = undefined,
+    /// Unattended runs: there is no one to type, every read ends the input.
+    closed: bool = false,
 
     pub fn init(self: *Input, io: std.Io) void {
         self.reader = std.Io.File.stdin().reader(io, &self.buf);
@@ -14,6 +16,7 @@ pub const Input = struct {
 
     /// Next line without the newline; null at end of input.
     pub fn line(self: *Input) ?[]const u8 {
+        if (self.closed) return null;
         const l = self.reader.interface.takeDelimiter('\n') catch return null;
         return std.mem.trim(u8, l orelse return null, "\r");
     }
@@ -131,4 +134,6 @@ pub const State = struct {
     /// Set for the duration of one tool call when one of the user's allow rules matched: the approval
     /// prompt is then answered "yes" automatically (and says which rule did it).
     rule_allow: ?[]const u8 = null,
+    /// A scheduled run: nobody can approve or answer, so anything that needs a person is denied.
+    unattended: bool = false,
 };

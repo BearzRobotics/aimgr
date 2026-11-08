@@ -61,6 +61,10 @@ fn shellQuote(arena: std.mem.Allocator, argv: []const []const u8) ![]u8 {
 pub const Outcome = struct { text: []const u8, decision: []const u8, reason: []const u8 };
 
 pub fn ask(e: Env, st: *State, question: []const u8) bool {
+    if (st.unattended) {
+        e.out.print("\n  (unattended run: \"{s}\" would need approval, so it is denied)\n", .{question[0..@min(question.len, 100)]}) catch {};
+        return false;
+    }
     if (st.rule_allow) |rule| {
         e.out.print("\n  (approved automatically by your rule {s})\n", .{rule}) catch {};
         return true;

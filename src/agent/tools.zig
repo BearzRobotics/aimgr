@@ -104,6 +104,8 @@ pub const Features = struct {
     skills: bool = false,
     /// A search endpoint is configured (web_search is only offered with web).
     search: bool = false,
+    /// False for unattended (scheduled) runs: no questions to the user, no notifications.
+    interactive: bool = true,
 };
 
 /// JSON array of the tools this level may use (the model is only told about these).
@@ -127,7 +129,7 @@ pub fn schemasForFeatures(arena: std.mem.Allocator, feat: Features) ![]u8 {
         try add(&out, arena, &first, schema_read_file);
         try add(&out, arena, &first, schema_search_files);
         try add(&out, arena, &first, schema_find_files);
-        try add(&out, arena, &first, schema_ask_user);
+        if (feat.interactive) try add(&out, arena, &first, schema_ask_user);
         try add(&out, arena, &first, schema_update_todos);
         if (feat.skills) try add(&out, arena, &first, schema_load_skill);
         if (feat.plan_mode) try add(&out, arena, &first, schema_submit_plan);
@@ -138,7 +140,7 @@ pub fn schemasForFeatures(arena: std.mem.Allocator, feat: Features) ![]u8 {
     if (!feat.plan_mode) {
         if (feat.level.atLeast(.inspect)) {
             try add(&out, arena, &first, schema_run_command);
-            try add(&out, arena, &first, schema_notify);
+            if (feat.interactive) try add(&out, arena, &first, schema_notify);
         }
         if (feat.level == .ask) {
             try add(&out, arena, &first, schema_write_file);

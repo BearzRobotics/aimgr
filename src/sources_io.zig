@@ -6,6 +6,7 @@ const config = @import("config.zig");
 const http = @import("http.zig");
 const sources = @import("sources.zig");
 const agent_settings = @import("agent/settings.zig");
+const schedule = @import("schedule.zig");
 
 pub const Loaded = struct {
     list: []sources.Source,
@@ -31,24 +32,56 @@ pub fn load(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     return .{ .list = list, .path = path };
 }
 
-/// Atomic replace (temp file + rename). Creates the config directory if needed. Existing
-/// [[agent]] tables in the file are preserved.
-pub fn save(arena: std.mem.Allocator, io: std.Io, path: []const u8, list: []const sources.Source) !void {
-    var text = try sources.serialize(arena, list);
-    if (std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20))) |old| {
-        if (agent_settings.parse(arena, arena, old)) |agents| {
-            if (agents.len > 0) text = try std.mem.concat(arena, u8, &.{ text, try agent_settings.serialize(arena, agents) });
-        } else |_| {}
-    } else |_| {}
-    try writeAtomic(arena, io, path, text);
+/// The non-source tables already in the file, so rewriting one kind never drops another.
+const Extras = struct {
+    agents: []agent_settings.Entry = &.{},
+    schedules: []schedule.Entry = &.{},
+};
+
+fn readExtras(arena: std.mem.Allocator, io: std.Io, path: []const u8) Extras {
+    const old = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch return .{};
+    return .{
+        .agents = agent_settings.parse(arena, arena, old) catch &.{},
+        .schedules = schedule.parse(arena, arena, old) catch &.{},
+    };
 }
 
-/// Replace the [[agent]] tables, keeping the [[source]] tables as they are.
+fn compose(arena: std.mem.Allocator, list: []const sources.Source, agents: []const agent_settings.Entry, schedules: []const schedule.Entry) ![]u8 {
+    return std.mem.concat(arena, u8, &.{
+        try sources.serialize(arena, list),
+        try agent_settings.serialize(arena, agents),
+        try schedule.serialize(arena, schedules),
+    });
+}
+
+/// Atomic replace (temp file + rename). Creates the config directory if needed. Existing [[agent]] and
+/// [[schedule]] tables in the file are preserved.
+pub fn save(arena: std.mem.Allocator, io: std.Io, path: []const u8, list: []const sources.Source) !void {
+    const ex = readExtras(arena, io, path);
+    try writeAtomic(arena, io, path, try compose(arena, list, ex.agents, ex.schedules));
+}
+
+/// Replace the [[agent]] tables, keeping sources and schedules as they are.
 pub fn saveAgents(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, entries: []const agent_settings.Entry) !void {
     const loaded = try load(arena, gpa, io, env);
     const path = loaded.path orelse return error.NoConfigDir;
-    const text = try std.mem.concat(arena, u8, &.{ try sources.serialize(arena, loaded.list), try agent_settings.serialize(arena, entries) });
-    try writeAtomic(arena, io, path, text);
+    const ex = readExtras(arena, io, path);
+    try writeAtomic(arena, io, path, try compose(arena, loaded.list, entries, ex.schedules));
+}
+
+/// Replace the [[schedule]] tables, keeping sources and agent settings as they are.
+pub fn saveSchedules(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, entries: []const schedule.Entry) !void {
+    const loaded = try load(arena, gpa, io, env);
+    const path = loaded.path orelse return error.NoConfigDir;
+    const ex = readExtras(arena, io, path);
+    try writeAtomic(arena, io, path, try compose(arena, loaded.list, ex.agents, entries));
+}
+
+pub fn loadSchedules(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]schedule.Entry {
+    const path = (try configFile(arena, env)) orelse return &.{};
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch return &.{};
+    defer gpa.free(text);
+    return schedule.parse(arena, gpa, text);
 }
 
 pub fn loadAgents(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]agent_settings.Entry {

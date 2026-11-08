@@ -10,6 +10,7 @@ const usage =
     \\commands:
     \\  tui      interactive interface (default when run in a terminal)
     \\  agent    let a tool-capable model inspect files / run commands under guardrails: agent <ollama> <model> --dir DIR | show | set | settings | reset
+    \\  schedule saved agent tasks that run unattended (read-only/inspect only): schedule add|list|run|run-due|results|install ...
     \\  sources  manage where models are discovered: sources [list] | add <kind> <id> [<location>] | enable|disable|remove <id> | refresh [<id>]
     \\  search   search Hugging Face for GGUF models (network, only when you run it): search <text> [--limit N]
     \\  browse   list GGUF models without a query (network, only when you run it): browse [--sort trending|downloads|recent] [--limit N]
@@ -68,6 +69,9 @@ pub fn main(init: std.process.Init) !u8 {
     } else if (std.mem.eql(u8, cmd, "agent")) {
         const report = inv.discover(arena, init.gpa, io);
         code = try aimgr.agent_cmd.main(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
+    } else if (std.mem.eql(u8, cmd, "schedule")) {
+        const report = inv.discover(arena, init.gpa, io);
+        code = try aimgr.schedule_cmd.main(arena, init.gpa, io, init.environ_map, out, err, report, args[2..]);
     } else if (std.mem.eql(u8, cmd, "sources")) {
         code = try aimgr.sources_cmd.run(arena, init.gpa, io, init.environ_map, out, err, args[2..]);
     } else if (std.mem.eql(u8, cmd, "search")) {

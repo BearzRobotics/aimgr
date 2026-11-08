@@ -54,6 +54,7 @@ fn findFiles(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, a
 // ---- ask_user --------------------------------------------------------------------------------
 
 fn askUser(e: Env, st: *State, arena: std.mem.Allocator, args: std.json.ObjectMap) !Outcome {
+    if (st.unattended) return calls.denied(arena, "this is an unattended run: no one is present to answer, decide with what you have");
     const q = calls.getStr(args, "question") orelse return calls.denied(arena, "missing 'question'");
     if (q.len == 0 or q.len > 500) return calls.denied(arena, "question must be 1-500 characters");
     st.questions += 1;

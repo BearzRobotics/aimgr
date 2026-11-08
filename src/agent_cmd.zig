@@ -230,11 +230,24 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     }
     eff.s.dirs = dirs.items;
 
+    return launch(arena, gpa, io, env, out, err, kind, id, eff.s, .interactive);
+}
+
+pub const Once = struct { task: []const u8, transcript: *std.Io.Writer };
+pub const Mode = union(enum) { interactive, once: Once };
+
+/// Everything after the settings are known and the directories are validated: check the backend server,
+/// pick the sandbox, (for llama) start the private server, then run an interactive session or one unattended task.
+pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, out_in: *std.Io.Writer, err: *std.Io.Writer, kind: backend.Kind, id: []const u8, s: policy.Settings, mode: Mode) !u8 {
+    const out: *std.Io.Writer = switch (mode) {
+        .interactive => out_in,
+        .once => |o| o.transcript,
+    };
     if (kind == .ollama and !netstat.isListening(gpa, io, 11434)) {
         try err.writeAll("aimgr: the ollama daemon is not running on 127.0.0.1:11434. Start it with: aimgr serve ollama\n");
         return 1;
     }
-    const sandbox_on = switch (eff.s.sandbox) {
+    const sandbox_on = switch (s.sandbox) {
         .none => false,
         .auto => tools.sandboxAvailable(gpa, io),
         .bwrap => blk: {
@@ -247,12 +260,15 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     };
 
     var input: run.Input = undefined;
-    input.init(io);
+    switch (mode) {
+        .interactive => input.init(io),
+        .once => input = .{ .reader = undefined, .closed = true },
+    }
     const audit = try config.statePath(arena, env, "agent-audit.log");
     var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env), .state_dir = config.statePath(arena, env, "agent-bg") catch null };
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
-    if (kind == .ollama) return run.session(renv, id, eff.s, sandbox_on);
+    if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena);
 
     // llama: start a private server for this session, verify tool support, always stop it afterwards.
     const log_dir = try config.statePath(arena, env, "logs");
@@ -274,7 +290,21 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
     }
     renv.api = .openai;
     renv.host_port = try std.fmt.allocPrint(arena, "127.0.0.1:{d}", .{srv.port});
-    return run.session(renv, id, eff.s, sandbox_on);
+    return finish(renv, id, s, sandbox_on, mode, arena);
+}
+
+fn finish(renv: run.Env, id: []const u8, s: policy.Settings, sandbox_on: bool, mode: Mode, arena: std.mem.Allocator) !u8 {
+    switch (mode) {
+        .interactive => return run.session(renv, id, s, sandbox_on),
+        .once => |o| {
+            const text = (try run.runOnce(renv, id, s, sandbox_on, o.task, arena)) orelse {
+                try o.transcript.writeAll("\nRESULT: the model server could not be reached or failed.\n");
+                return 1;
+            };
+            try o.transcript.print("\n## Result\n\n{s}\n", .{text});
+            return 0;
+        },
+    }
 }
 
 /// ~/.config/aimgr/skills if it exists (user-written *.md instruction files for load_skill).
