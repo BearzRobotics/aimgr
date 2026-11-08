@@ -106,6 +106,8 @@ pub const Features = struct {
     search: bool = false,
     /// False for unattended (scheduled) runs: no questions to the user, no notifications.
     interactive: bool = true,
+    /// Ready-made function schemas of MCP tools (level ask only).
+    extra: []const []const u8 = &.{},
 };
 
 /// JSON array of the tools this level may use (the model is only told about these).
@@ -155,6 +157,7 @@ pub fn schemasForFeatures(arena: std.mem.Allocator, feat: Features) ![]u8 {
                 try add(&out, arena, &first, schema_check_background);
                 try add(&out, arena, &first, schema_stop_background);
             }
+            for (feat.extra) |sc| try add(&out, arena, &first, sc);
             try add(&out, arena, &first, schema_enter_worktree);
             try add(&out, arena, &first, schema_exit_worktree);
         }

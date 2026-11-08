@@ -119,3 +119,14 @@ Copyright 2026 aimgr contributors. SPDX-License-Identifier: GPL-2.0-only
 
 LICENSE
 aimgr is licensed under the GNU General Public License, version 2 only. The complete text is in the LICENSE file. Vendored components keep their own licenses (MIT: toml-zig, libvaxis, uucode, llama.cpp converter; see vendor/*/LICENSE) and are GPL-2.0-compatible.
+
+## MCP servers
+
+At agent level `ask`, tools of MCP servers listed in `~/.config/aimgr/mcp.toml` are offered as `mcp__<id>__<tool>`:
+
+    [[mcp]]
+    id = "files"
+    command = ["python3", "/path/to/server.py"]
+    read_only_tools = ["search"]
+
+Every call asks for approval unless the tool is in `read_only_tools`. Servers are programs you chose; they are not sandboxed. Each call starts the server, sends the request and lets it exit (30 s default timeout x 3).

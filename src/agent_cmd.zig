@@ -265,7 +265,7 @@ pub fn launch(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env:
         .once => input = .{ .reader = undefined, .closed = true },
     }
     const audit = try config.statePath(arena, env, "agent-audit.log");
-    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env), .state_dir = config.statePath(arena, env, "agent-bg") catch null };
+    var renv: run.Env = .{ .gpa = gpa, .io = io, .out = out, .err = err, .input = &input, .audit_path = audit, .host_port = "127.0.0.1:11434", .path_env = env.get("PATH"), .home = env.get("HOME"), .skills_dir = skillsDir(arena, io, env), .state_dir = config.statePath(arena, env, "agent-bg") catch null, .mcp = loadMcp(arena, gpa, io, env, err) };
     try out.print("audit log: {s}\n", .{audit orelse "(none)"});
 
     if (kind == .ollama) return finish(renv, id, s, sandbox_on, mode, arena);
@@ -321,4 +321,12 @@ fn inventoryHas(report: inventory.Inventory, kind: backend.Kind, id: []const u8)
         for (r.models orelse &.{}) |m| if (std.mem.eql(u8, m.id, id)) return true;
     }
     return false;
+}
+
+fn loadMcp(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, err: *std.Io.Writer) []const @import("mcp.zig").Server {
+    const path = (config.configPath(arena, env, "mcp.toml") catch return &.{}) orelse return &.{};
+    return @import("mcp.zig").load(arena, gpa, io, path) catch {
+        err.print("aimgr: {s} is invalid; MCP servers are not loaded\n", .{path}) catch {};
+        return &.{};
+    };
 }

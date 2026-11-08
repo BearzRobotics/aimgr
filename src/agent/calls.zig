@@ -9,6 +9,7 @@ const extra = @import("extra.zig");
 const workflow = @import("workflow.zig");
 
 const Env = envm.Env;
+const mcp = @import("../mcp.zig");
 const State = envm.State;
 
 /// What a rule pattern is matched against, per tool (paths are normalized so rules can use absolute paths).
@@ -90,9 +91,42 @@ pub fn denied(arena: std.mem.Allocator, reason: []const u8) !Outcome {
 
 /// Run one tool call through policy and (if needed) the user. Never returns an error for model mistakes:
 /// those become text for the model.
+/// A tool of a user-configured MCP server: level ask only, never in plan mode / unattended / sub-agents,
+/// approval for every call unless the user listed the tool as read-only (deny rules always apply).
+fn mcpCall(e: Env, st: *State, arena: std.mem.Allocator, s: policy.Settings, server: []const u8, tool: []const u8, call: chat.Call) anyerror!Outcome {
+    if (s.level != .ask or st.plan_mode or st.unattended or st.depth != 0) return denied(arena, "MCP tools need level ask, outside plan mode, in the main session");
+    // Only tools the server really announced at session start can be called.
+    var idx: ?usize = null;
+    for (st.mcp_tools orelse &.{}) |t| {
+        if (std.mem.eql(u8, e.mcp[t.server].id, server) and std.mem.eql(u8, t.name, tool)) idx = t.server;
+    }
+    const si = idx orelse return denied(arena, "unknown tool");
+    const srv = e.mcp[si];
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, call.args_json, .{}) catch return denied(arena, "arguments are not valid JSON");
+    if (parsed.value != .object) return denied(arena, "arguments must be an object");
+    st.rule_allow = null;
+    defer st.rule_allow = null;
+    switch (policy.ruleCheck(s, call.name, call.args_json)) {
+        .deny => |r| return denied(arena, try std.fmt.allocPrint(arena, "denied by your rule {s}", .{r})),
+        .allow => |r| st.rule_allow = r,
+        .none => {},
+    }
+    var how: []const u8 = "auto (listed read-only)";
+    if (!mcp.isReadOnly(srv, tool)) {
+        const shown = call.args_json[0..@min(call.args_json.len, 300)];
+        if (!ask(e, st, try std.fmt.allocPrint(arena, "ALLOW MCP tool {s}.{s} (a program you configured, NOT sandboxed) with {s}?", .{ server, tool, shown }))) return .{ .text = "DENIED: the user declined", .decision = "declined", .reason = "mcp" };
+        how = "approved";
+    }
+    try e.out.print("  [{s}]  ({s})\n", .{ call.name, how });
+    const tmp = e.state_dir orelse return denied(arena, "no state directory for MCP");
+    const text = mcp.callTool(arena, e.gpa, e.io, tmp, srv, tool, call.args_json, s.timeout_s * 3);
+    return .{ .text = text, .decision = how, .reason = "mcp" };
+}
+
 pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Settings, sandbox_on: bool, call: chat.Call) anyerror!Outcome {
     // Inside a git worktree the working directory is the worktree (the originals stay allowed).
     const s = try workflow.view(arena, s_in, st);
+    if (mcp.splitName(call.name)) |m| return mcpCall(e, st, arena, s, m.server, m.tool, call);
     const tool = tools.toolFromName(call.name) orelse return denied(arena, "unknown tool");
     const level_ok = switch (tool) {
         .list_dir, .read_file, .search_files, .find_files, .ask_user, .update_todos, .load_skill => s.level.atLeast(.read_only),

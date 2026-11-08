@@ -50,7 +50,27 @@ fn featuresFor(e: Env, s: policy.Settings, st: *const State) tools.Features {
         .skills = st.skills_dir != null and e.skills_dir != null,
         .search = s.search_url != null,
         .interactive = !st.unattended,
+        .extra = st.mcp_schemas,
     };
+}
+
+/// Ask the configured MCP servers for their tools, once per session (never unattended, never in sub-agents).
+fn loadMcp(e: Env, st: *State, s: policy.Settings) void {
+    if (st.mcp_tools != null or e.mcp.len == 0 or st.unattended or st.depth != 0 or s.level != .ask) return;
+    const tmp = e.state_dir orelse return;
+    var tl: std.ArrayList(@import("../mcp.zig").Tool) = .empty;
+    var sc: std.ArrayList([]const u8) = .empty;
+    for (e.mcp, 0..) |srv, i| {
+        const found = @import("../mcp.zig").listTools(std.heap.page_allocator, e.gpa, e.io, tmp, i, srv);
+        if (found.len == 0) e.err.print("aimgr: MCP server '{s}' offered no tools (not found, failed or too slow)\n", .{srv.id}) catch {};
+        for (found) |t| {
+            const j = @import("../mcp.zig").schemaJson(std.heap.page_allocator, srv, t) catch continue;
+            tl.append(std.heap.page_allocator, t) catch continue;
+            sc.append(std.heap.page_allocator, j) catch continue;
+        }
+    }
+    st.mcp_tools = tl.items;
+    st.mcp_schemas = sc.items;
 }
 
 /// One request: model <-> tools until a reply without tool calls (or the step budget runs out).
@@ -58,6 +78,7 @@ fn featuresFor(e: Env, s: policy.Settings, st: *const State) tools.Features {
 fn converse(e: Env, st: *State, ha: std.mem.Allocator, turn: *std.heap.ArenaAllocator, msgs: *std.ArrayList(chat.Msg), s: policy.Settings, sandbox_on: bool, audit: *Audit, indent: []const u8) anyerror!?[]const u8 {
     var steps: u32 = 0;
     var last: []const u8 = "";
+    loadMcp(e, st, s);
     while (true) {
         if (steps >= s.max_steps) {
             try e.out.print("{s}(stopped after {d} steps; ask again to continue)\n", .{ indent, steps });

@@ -1,6 +1,7 @@
 //! Shared types for agent sessions: the single stdin reader, the environment, session state and the audit log.
 const std = @import("std");
 const chat = @import("chat.zig");
+const mcp = @import("../mcp.zig");
 const process = std.process;
 
 /// One stdin reader shared by the prompt and all approvals (two buffered readers would lose input).
@@ -42,6 +43,8 @@ pub const Env = struct {
     skills_dir: ?[]const u8 = null,
     /// Where background task logs go ($XDG_STATE_HOME/aimgr/agent-bg).
     state_dir: ?[]const u8 = null,
+    /// MCP servers from mcp.toml (user-chosen programs; tools need approval unless listed read-only).
+    mcp: []const mcp.Server = &.{},
 };
 
 pub const Audit = struct {
@@ -113,6 +116,9 @@ pub const Todo = struct {
 
 /// Mutable state of one conversation (shared with tool handlers). Strings live in the session arena.
 pub const State = struct {
+    /// MCP tools found at the start of the session (null = not asked yet) and their function schemas.
+    mcp_tools: ?[]const mcp.Tool = null,
+    mcp_schemas: []const []const u8 = &.{},
     todos: std.ArrayList(Todo) = .empty,
     /// Plan mode: only read tools and submit_plan are offered until the user approves a plan.
     plan_mode: bool = false,

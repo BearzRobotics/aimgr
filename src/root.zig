@@ -1,5 +1,6 @@
 pub const backend = @import("backend.zig");
 pub const process = @import("process.zig");
+pub const mcp = @import("mcp.zig");
 pub const inventory = @import("inventory.zig");
 pub const catalog = @import("catalog.zig");
 pub const config = @import("config.zig");
