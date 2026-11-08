@@ -23,6 +23,7 @@ const win = if (is_windows) struct {
     const CSBI = extern struct { size: COORD, cursor: COORD, attributes: u16, window: SMALL_RECT, max_size: COORD };
     extern "kernel32" fn GetStdHandle(n: u32) callconv(.winapi) ?HANDLE;
     extern "kernel32" fn GetConsoleScreenBufferInfo(h: HANDLE, info: *CSBI) callconv(.winapi) c_int;
+    extern "kernel32" fn WriteFile(h: HANDLE, buf: [*]const u8, len: u32, written: *u32, overlapped: ?*anyopaque) callconv(.winapi) c_int;
     extern "kernel32" fn SetEnvironmentVariableW(name: [*:0]const u16, value: [*:0]const u16) callconv(.winapi) c_int;
     extern "kernel32" fn SetConsoleCtrlHandler(cb: ?*const fn (c_uint) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
 } else struct {};
@@ -126,15 +127,36 @@ pub fn prependPath(arena: std.mem.Allocator, env: *std.process.Environ.Map, dir:
 
 /// Columns of the terminal on stdout, or null when stdout is not a terminal.
 pub fn termWidth() ?u16 {
+    const sz = termSize() orelse return null;
+    return sz.cols;
+}
+
+pub const Size = struct { rows: u16, cols: u16 };
+
+/// Rows and columns of the terminal on stdout, or null when stdout is not a terminal.
+pub fn termSize() ?Size {
     if (is_windows) {
         const h = win.GetStdHandle(@bitCast(@as(i32, -11))) orelse return null; // STD_OUTPUT_HANDLE
         var info: win.CSBI = undefined;
         if (win.GetConsoleScreenBufferInfo(h, &info) == 0) return null;
         const w = info.window.right - info.window.left + 1;
-        return if (w > 0) @intCast(w) else null;
+        const ht = info.window.bottom - info.window.top + 1;
+        if (w <= 0 or ht <= 0) return null;
+        return .{ .rows = @intCast(ht), .cols = @intCast(w) };
     }
     var ws: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const rc = std.posix.system.ioctl(1, std.posix.T.IOCGWINSZ, @intFromPtr(&ws));
-    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return null;
-    return ws.col;
+    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0 or ws.row == 0) return null;
+    return .{ .rows = ws.row, .cols = ws.col };
+}
+
+/// Write bytes straight to stdout without buffering (safe to call from an interrupt handler).
+pub fn writeStdoutRaw(bytes: []const u8) void {
+    if (is_windows) {
+        const h = win.GetStdHandle(@bitCast(@as(i32, -11))) orelse return;
+        var n: u32 = 0;
+        _ = win.WriteFile(h, bytes.ptr, @intCast(bytes.len), &n, null);
+        return;
+    }
+    _ = std.posix.system.write(1, bytes.ptr, bytes.len);
 }

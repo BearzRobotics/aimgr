@@ -2,6 +2,7 @@
 //! The model's output is data: it never changes the settings, never approves anything, and a denied or
 //! declined action is simply reported back to it as text.
 const std = @import("std");
+const platform = @import("../platform.zig");
 const chat = @import("chat.zig");
 const policy = @import("policy.zig");
 const tools = @import("tools.zig");
@@ -249,35 +250,81 @@ fn bang(e: Env, ha: std.mem.Allocator, s: policy.Settings, msgs: *std.ArrayList(
     try msgs.append(ha, .{ .role = .assistant, .content = "Noted." });
 }
 
-/// The input prompt. On a colour terminal it looks like Claude Code's: a rule above and below the line you type
-/// on and a status line under it; after Enter your message is redrawn as a shaded block so it stands apart
-/// from the model's replies. Elsewhere (pipes, NO_COLOR, old consoles) it is a plain "you>" line.
-fn readPrompt(e: Env, model: []const u8, s: policy.Settings, st: *const State) !?[]const u8 {
-    if (!e.color) {
+/// The bottom of the screen during a session on a colour terminal: two rules around the input line and a status
+/// line, pinned in the last four rows (like Claude Code's input box). Everything else (your messages, replies, tool
+/// lines, approvals) scrolls in a terminal scroll region above it, so the box never disappears.
+const Screen = struct {
+    on: bool = false,
+    rows: u16 = 0,
+    cols: u16 = 0,
+
+    const box_rows = 4;
+
+    fn begin(self: *Screen, e: Env) !void {
+        if (!e.color) return;
+        const sz = platform.termSize() orelse return;
+        if (sz.rows < 12 or sz.cols < 30) return;
+        self.* = .{ .on = true, .rows = sz.rows, .cols = sz.cols };
+        // Make room for the box, limit scrolling to the rows above it, park the cursor at the bottom of that region.
+        try e.out.writeAll("\n\n\n\n");
+        try e.out.print("\x1b[1;{d}r\x1b[{d};1H", .{ self.rows - box_rows, self.rows - box_rows });
+        try e.out.flush();
+        platform.onInterrupt(onInterrupt, true);
+    }
+
+    fn end(self: *Screen, e: Env) void {
+        if (!self.on) return;
+        e.out.print("\x1b[r\x1b[{d};1H\x1b[J", .{self.rows - box_rows + 1}) catch {};
+        e.out.flush() catch {};
+        platform.resetInterrupt();
+        self.on = false;
+    }
+
+    /// Draw the box (input line empty, or `status_note` in place of the hints while the model works).
+    fn drawBox(self: *Screen, e: Env, status: []const u8) !void {
+        const r = self.rows;
+        try e.out.writeAll("\x1b7"); // save the output cursor
+        try e.out.print("\x1b[{d};1H\x1b[2K\x1b[2m", .{r - 3});
+        for (0..self.cols) |_| try e.out.writeAll("─");
+        try e.out.print("\x1b[0m\x1b[{d};1H\x1b[2K\x1b[1;36m❯\x1b[0m \x1b[{d};1H\x1b[2K\x1b[2m", .{ r - 2, r - 1 });
+        for (0..self.cols) |_| try e.out.writeAll("─");
+        try e.out.print("\x1b[0m\x1b[{d};1H\x1b[2K\x1b[2m  {s}\x1b[0m", .{ r, status[0..@min(status.len, self.cols -| 3)] });
+        try e.out.writeAll("\x1b8"); // back to where output continues
+    }
+};
+
+/// Ctrl-C during a session: give the terminal its whole screen back before exiting (async-signal-safe).
+fn onInterrupt() void {
+    platform.writeStdoutRaw("\x1b[r\x1b[999;1H\n");
+    std.process.exit(130);
+}
+
+fn statusText(a: std.mem.Allocator, model: []const u8, s: policy.Settings, st: *const State, tail: []const u8) ![]const u8 {
+    const level_txt = if (s.level == .off) "chat" else s.level.text();
+    return std.fmt.allocPrint(a, "{s} · {s} · {s}   {s}", .{ model, level_txt, modeText(st), tail });
+}
+
+/// Read one line from the user. With the pinned box the cursor goes into the box; after Enter your message is
+/// added above as a shaded block and the box stays (showing that the model is working). Without a colour
+/// terminal (pipes, NO_COLOR, old consoles) it is a plain "you>" line.
+fn readPrompt(e: Env, scr: *Screen, ta: std.mem.Allocator, model: []const u8, s: policy.Settings, st: *const State) !?[]const u8 {
+    if (!scr.on) {
         try e.out.print("\n[{s} · {s} · {s}]\nyou> ", .{ model, s.level.text(), modeText(st) });
         try e.out.flush();
         return e.input.line();
     }
-    const w: usize = @max(20, @min(@as(usize, @import("../platform.zig").termWidth() orelse e.width), 400));
-    var rule_buf: [400 * 3]u8 = undefined;
-    var n: usize = 0;
-    for (0..w) |_| {
-        @memcpy(rule_buf[n .. n + 3], "─");
-        n += 3;
-    }
-    const rule = rule_buf[0..n];
-    const level_txt = if (s.level == .off) "chat" else s.level.text();
-    try e.out.print("\n\x1b[2m{s}\x1b[0m\n\n\x1b[2m{s}\x1b[0m\n\x1b[2m  {s} · {s} · {s}   /help · !command · /exit\x1b[0m\x1b[2A\r\x1b[1;36m❯\x1b[0m ", .{ rule, rule, model, level_txt, modeText(st) });
+    try scr.drawBox(e, try statusText(ta, model, s, st, "/help · !command · /exit"));
+    try e.out.writeAll("\x1b7"); // remember where output continues
+    try e.out.print("\x1b[{d};3H", .{scr.rows - 2}); // into the input line
     try e.out.flush();
     const line = e.input.line() orelse {
-        try e.out.writeAll("\x1b[2B\n");
+        try e.out.writeAll("\x1b8");
         return null;
     };
-    // Enter left the cursor on the line under the last row of input: go back to the top rule and redraw.
-    const cols = (std.unicode.utf8CountCodepoints(line) catch line.len) + 2;
-    const rows = @max(1, (cols + w - 1) / w);
-    try e.out.print("\x1b[{d}A\r\x1b[J", .{rows + 1});
-    if (line.len > 0) try e.out.print("\x1b[48;5;237m\x1b[97m ❯ {s} \x1b[0m\n", .{line});
+    try e.out.writeAll("\x1b8");
+    if (line.len > 0) try e.out.print("\n\x1b[48;5;237m\x1b[97m ❯ {s} \x1b[0m\n", .{line});
+    // Long input may have wrapped over the rules: redraw; while the model works the box says so.
+    try scr.drawBox(e, try statusText(ta, model, s, st, if (line.len > 0 and line[0] != '/' and line[0] != '!') "working… (replies appear above)" else "/help · !command · /exit"));
     try e.out.flush();
     return line;
 }
@@ -359,9 +406,13 @@ pub fn session(e0: Env, model: []const u8, s_in: policy.Settings, sandbox_on: bo
     if (notes_path) |p| try e.out.print("project notes: {s}\n", .{p});
     if (s.level != .off) try e.out.writeAll("Type a request, or /help. Every change is shown before it happens; answer 'a' to stop asking for the same thing.\n");
     if (st.plan_mode) try e.out.writeAll("PLAN MODE: only reading tools until you approve a plan.\n");
+    var scr: Screen = .{};
+    try scr.begin(e);
+    defer scr.end(e);
 
     while (true) {
-        const user = (try readPrompt(e, model, s, &st)) orelse return 0;
+        _ = turn.reset(.retain_capacity);
+        const user = (try readPrompt(e, &scr, turn.allocator(), model, s, &st)) orelse return 0;
         if (user.len == 0) continue;
         if (std.mem.eql(u8, user, "/exit") or std.mem.eql(u8, user, "/quit")) return 0;
         if (user[0] == '!') {

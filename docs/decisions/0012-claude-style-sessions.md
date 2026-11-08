@@ -14,7 +14,9 @@ outside the trusted folder by saying so. aimgr also had to work for non-technica
 - **Input between two rules.** On a colour terminal the prompt is a line between two full-width rules with a status
   line (model, level, mode) under them; after Enter the message is redrawn as a shaded `❯` block; replies start with
   `●`, are Markdown rendered with md-zig (vendored, BearzRobotics/md-zig v0.3.0) and indented under the bullet.
-  Line-oriented on purpose (no full-screen redraw), so scrollback, copy and paste keep working. Plain `you>` for
+  The box is pinned to the bottom four rows with a terminal scroll region (DECSTBM): output scrolls above it and
+  the box never disappears, also while the model works. Still line-oriented (no full-screen redraw), so the
+  terminal's scrollback, copy and paste keep working; the region is reset on exit and on Ctrl-C. Plain `you>` for
   pipes, NO_COLOR and consoles without ANSI.
 - **Approvals.** `[y/N/a]`: `a` = this exact action for the rest of the session; on a file edit it turns on edits
   mode. Session only: persistence stays explicit (rules). Deletes, plan approval and worktree switches never get `a`.
