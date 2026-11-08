@@ -8,6 +8,8 @@ const jobs = @import("jobs.zig");
 const hardware = @import("../hardware.zig");
 const catalog = @import("../catalog.zig");
 const discover = @import("../discover.zig");
+const agent_settings = @import("../agent/settings.zig");
+const settings_view = @import("settings_view.zig");
 
 pub const Target = struct { backend: backend.Kind, id: []const u8 };
 
@@ -39,6 +41,8 @@ pub const App = struct {
     report: inventory.Inventory = undefined,
     loaded: catalog_io.Loaded = .{},
     rows: []model.Row = &.{},
+    /// Stored per-model agent settings (rebuilt on refresh).
+    agent_entries: []const agent_settings.Entry = &.{},
     /// `ollama show` facts for installed Ollama models (rebuilt on refresh).
     infos: model.InfoMap = .empty,
     /// Results of the last online search (kept across refreshes).
@@ -102,5 +106,12 @@ pub const App = struct {
         const vis = self.visibleJobs(self.frame.allocator()) catch return null;
         if (vis.len == 0) return null;
         return &self.jobs.list.items[vis[@min(self.sel[@backingInt(self.tab)], vis.len - 1)]];
+    }
+
+    /// Selectable rows of the Settings tab (sources, then tool-capable models).
+    pub fn settingsItems(self: *const App, arena: std.mem.Allocator) ![]settings_view.Item {
+        var models: std.ArrayList(backend.Model) = .empty;
+        for (self.report.reports) |r| try models.appendSlice(arena, r.models orelse &.{});
+        return settings_view.items(arena, self.loaded.sources, models.items, &self.infos, self.agent_entries);
     }
 };

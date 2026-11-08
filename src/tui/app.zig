@@ -20,6 +20,8 @@ const agent_settings = @import("../agent/settings.zig");
 const abl = @import("../abliterate.zig");
 const hardware = @import("../hardware.zig");
 const agent_policy = @import("../agent/policy.zig");
+const settings_view = @import("settings_view.zig");
+const sources_mod = @import("../sources.zig");
 const modelinfo = @import("../modelinfo.zig");
 
 const App = State.App;
@@ -104,6 +106,7 @@ pub fn refresh(app: *App) void {
     app.report = inventory.discover(a, app.gpa, app.io);
     app.loaded = catalog_io.loadAll(a, app.gpa, app.io, app.environ) catch .{};
     app.hw = hardware.detect(a, app.gpa, app.io) catch .{ .mem = .{}, .gpus = &.{} };
+    app.agent_entries = sources_io.loadAgents(a, app.gpa, app.io, app.environ) catch &.{};
     app.infos = .empty;
     var asked: usize = 0;
     for (app.report.reports) |r| {
@@ -167,7 +170,10 @@ fn listLen(app: *App) usize {
             const v = app.visibleJobs(app.frame.allocator()) catch break :blk 0;
             break :blk v.len;
         },
-        .settings => 0,
+        .settings => blk: {
+            const it = app.settingsItems(app.frame.allocator()) catch break :blk 0;
+            break :blk it.len;
+        },
     };
 }
 
@@ -212,7 +218,9 @@ fn handleKey(app: *App, key: term.Key) void {
         .end => moveSel(app, 1_000_000, listLen(app)),
         .left => setTab(app, prevTab(app.tab)),
         .right, .tab => setTab(app, nextTab(app.tab)),
-        .enter => app.detail_full = !app.detail_full,
+        .enter => if (app.tab == .settings) settingsActivate(app) else {
+            app.detail_full = !app.detail_full;
+        },
         .backspace => {},
         .char => |ch| charKey(app, ch),
     }
@@ -313,10 +321,11 @@ fn charKey(app: *App, ch: u21) void {
             rebuildRows(app);
         },
         'g' => if (app.tab == .installed) beginAgent(app),
+        ' ' => if (app.tab == .settings) settingsActivate(app),
+        'u' => if (app.tab == .settings) settingsRefreshSource(app) else askRowAction(app, .update),
         'c' => chat(app),
         's' => startServer(app),
         'd' => askRowAction(app, .pull),
-        'u' => askRowAction(app, .update),
         'x' => if (app.tab == .installed) askRowAction(app, .remove) else stopJob(app),
         else => {},
     }
@@ -687,4 +696,65 @@ fn runAgent(app: *App, id: []const u8, dir: ?[]const u8) void {
     term.resumeTerm();
     installSignals();
     if (code == 0) app.setMessage(false, "agent session ended", .{}) else app.setMessage(true, "agent exited with code {d} (see the messages above in your terminal history)", .{code});
+}
+
+// ---- Settings tab: sources and per-model agent levels -----------------------
+
+fn settingsCurrent(app: *App) ?settings_view.Item {
+    const it = app.settingsItems(app.frame.allocator()) catch return null;
+    if (it.len == 0) return null;
+    return it[@min(app.sel[@backingInt(model.Tab.settings)], it.len - 1)];
+}
+
+/// Enter / space: enable or disable the selected source, or step the selected model's agent level.
+fn settingsActivate(app: *App) void {
+    const item = settingsCurrent(app) orelse return;
+    const fa = app.frame.allocator();
+    switch (item) {
+        .source => |i| {
+            const loaded = sources_io.load(fa, app.gpa, app.io, app.environ) catch return app.setMessage(true, "cannot read the sources config", .{});
+            const path = loaded.path orelse return app.setMessage(true, "no config directory (HOME / XDG_CONFIG_HOME not set)", .{});
+            if (i >= app.loaded.sources.len) return;
+            // refresh() below frees the arena that owns app.loaded, so keep our own copy of the id.
+            const id = fa.dupe(u8, app.loaded.sources[i].id) catch return;
+            const idx = sources_mod.find(loaded.list, id) orelse return app.setMessage(true, "source '{s}' is not in the config file", .{id});
+            loaded.list[idx].enabled = !loaded.list[idx].enabled;
+            sources_io.save(fa, app.io, path, loaded.list) catch |e| return app.setMessage(true, "could not save the config: {s}", .{@errorName(e)});
+            const on = loaded.list[idx].enabled;
+            refresh(app);
+            app.setMessage(false, "source '{s}' {s}", .{ id, if (on) "enabled" else "disabled" });
+        },
+        .agent => |ag| {
+            var entries: std.ArrayList(agent_settings.Entry) = .empty;
+            entries.appendSlice(fa, app.agent_entries) catch return;
+            const next = settings_view.nextLevel(ag.level);
+            const model_id = fa.dupe(u8, ag.id) catch return; // ag.id lives in the arena refresh() frees
+            if (agent_settings.find(entries.items, .ollama, model_id)) |k| {
+                entries.items[k].level = next;
+            } else entries.append(fa, .{ .backend = .ollama, .id = model_id, .level = next }) catch return;
+            sources_io.saveAgents(fa, app.gpa, app.io, app.environ, entries.items) catch |e| return app.setMessage(true, "could not save the config: {s}", .{@errorName(e)});
+            refresh(app);
+            app.setMessage(false, "agent level for {s}: {s}{s}", .{ model_id, next.text(), switch (next) {
+                .off => " (chat only)",
+                .read_only => " (file tools in the chosen directories)",
+                .inspect => " (+ read-only commands)",
+                .ask => " (+ other commands and writes, each needs your approval)",
+            } });
+        },
+    }
+}
+
+/// `u` on a catalog-url source: download it now (explicit network step, runs as a job).
+fn settingsRefreshSource(app: *App) void {
+    const item = settingsCurrent(app) orelse return;
+    switch (item) {
+        .source => |i| {
+            if (i >= app.loaded.sources.len) return;
+            const src = app.loaded.sources[i];
+            if (src.kind != .catalog_url) return app.setMessage(true, "only catalog-url sources can be downloaded", .{});
+            if (!src.enabled) return app.setMessage(true, "enable the source first", .{});
+            startSelf(app, .refresh, .ollama, &.{ "sources", "refresh", src.id }, src.id);
+        },
+        .agent => app.setMessage(true, "u downloads a catalog-url source; select one in the Sources list", .{}),
+    }
 }

@@ -12,6 +12,7 @@ const launcher = @import("../launcher.zig");
 const hardware = @import("../hardware.zig");
 const progress_mod = @import("../progress.zig");
 const agent_policy = @import("../agent/policy.zig");
+const sources_mod = @import("../sources.zig");
 const State = @import("state.zig");
 
 const App = State.App;
@@ -411,6 +412,79 @@ fn stateWord(s: jobs.State) []const u8 {
     };
 }
 
+fn padRight(a: std.mem.Allocator, text: []const u8, width: usize) ![]const u8 {
+    if (text.len >= width) return text;
+    const out = try a.alloc(u8, width);
+    @memcpy(out[0..text.len], text);
+    @memset(out[text.len..], ' ');
+    return out;
+}
+
+/// Sources and agent levels, selectable. Returns the next free row (relative to `top`).
+fn drawSettingsLists(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usize) !usize {
+    const items = try app.settingsItems(a);
+    const sel = clampSel(app, items.len);
+    var y: usize = 0;
+    var printed_agent_head = false;
+    term.setAttr(term.A_BOLD | term.C_CYAN);
+    term.put(top, 1, cols, "Model sources   (Enter/space = enable or disable, u = download a catalog URL)");
+    y += 1;
+    for (items, 0..) |it, i| {
+        if (y + 2 >= h) break;
+        const picked = i == sel;
+        switch (it) {
+            .source => |si| {
+                const src = app.loaded.sources[si];
+                const state: []const u8 = switch (src.kind) {
+                    .bundled => "built in snapshot",
+                    .overlay => "your models.toml",
+                    .catalog_file => "local file",
+                    .catalog_url => "downloaded on request",
+                    .huggingface => "online: search / browse",
+                };
+                const line = try std.fmt.allocPrint(a, "{s}[{s}] {s:<14} {s:<13} {s}{s}{s}", .{ if (picked) "> " else "  ", if (src.enabled) "x" else " ", src.id, src.kind.text(), state, if (src.location != null) "  " else "", src.location orelse "" });
+                term.setAttr(if (picked) term.A_REVERSE else 0);
+                term.put(top + y, 1, cols, line);
+                term.setAttr((if (src.enabled) term.C_GREEN else term.C_YELLOW) | term.A_BOLD | (if (picked) term.A_REVERSE else 0));
+                term.put(top + y, 3, 3, if (src.enabled) "[x]" else "[ ]");
+                y += 1;
+            },
+            .agent => |ag| {
+                if (!printed_agent_head) {
+                    y += 1;
+                    term.setAttr(term.A_BOLD | term.C_CYAN);
+                    term.put(top + y, 1, cols, "Agent mode: autonomy per tool-capable model   (Enter/space = next level; g on Installed starts it)");
+                    y += 1;
+                    printed_agent_head = true;
+                }
+                if (y + 1 >= h) break;
+                const params = if (ag.params_b) |p| try std.fmt.allocPrint(a, "{d:.1}B", .{p}) else "?";
+                const id_w: usize = 34;
+                const id_shown = if (ag.id.len <= id_w) ag.id else try std.fmt.allocPrint(a, "{s}...", .{ag.id[0 .. id_w - 3]});
+                const prefix = try std.fmt.allocPrint(a, "{s}{s}", .{ if (picked) "> " else "  ", try padRight(a, id_shown, id_w) });
+                const line = try std.fmt.allocPrint(a, "{s} level {s:<9} {s}  {s}", .{
+                    prefix,
+                    ag.level.text(),
+                    if (ag.custom) "(yours)" else try std.fmt.allocPrint(a, "(default for {s})", .{params}),
+                    if (ag.stored_dirs) |d| (if (d.len > 0) try std.fmt.allocPrint(a, "dirs: {s}", .{d[0]}) else "") else "dir asked at start",
+                });
+                term.setAttr(if (picked) term.A_REVERSE else 0);
+                term.put(top + y, 1, cols, line);
+                const lc: c_int = switch (ag.level) {
+                    .off => 0,
+                    .read_only, .inspect => term.C_GREEN,
+                    .ask => term.C_YELLOW,
+                };
+                term.setAttr(lc | term.A_BOLD | (if (picked) term.A_REVERSE else 0));
+                term.put(top + y, 1 + prefix.len + " level ".len, 9, ag.level.text());
+                y += 1;
+            },
+        }
+    }
+    term.setAttr(0);
+    return y + 1;
+}
+
 fn drawSettings(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usize) !void {
     var lines: std.ArrayList([]const u8) = .empty;
     try lines.append(a, "Backends");
@@ -442,7 +516,8 @@ fn drawSettings(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h: usi
         try lines.append(a, try std.fmt.allocPrint(a, "  GPU: {s} {s}: {d:.1} GB VRAM, {d:.1} GB free{s}", .{ @tagName(g.vendor), g.label, hardware.gb(g.vram_total), hardware.gb(g.free()), if (g.integrated) " (integrated; ignored for fit)" else "" }));
     }
     try lines.append(a, "  Fit estimates are advisory ranges; architecture, context and runtime differ.");
-    var y: usize = 0;
+    // Interactive lists first: model sources, then per-model agent levels.
+    var y: usize = try drawSettingsLists(app, a, cols, top, h);
     for (lines.items) |l| {
         const indent = l.len - std.mem.trimStart(u8, l, " ").len;
         const bold = l.len > 0 and indent == 0;
@@ -512,7 +587,7 @@ fn drawStatus(app: *App, rows: usize, cols: usize) void {
         .installed => "c chat  g agent  s serve  u update  x delete  t good-for  b abliterate  ? keys  q quit",
         .discover => "d download  n search  N browse  t good-for  f access  b abliterate  ? keys  q quit",
         .transfers, .servers => "x stop  r refresh  ? help  q quit",
-        .settings => "r refresh  ? help  q quit",
+        .settings => "Enter/space toggle or change level  u download URL source  r refresh  ? keys  q quit",
     };
     term.setAttr(term.A_REVERSE);
     var y: usize = 0;

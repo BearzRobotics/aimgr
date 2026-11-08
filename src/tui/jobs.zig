@@ -7,7 +7,7 @@ const backend = @import("../backend.zig");
 const netstat = @import("../netstat.zig");
 const progress_mod = @import("../progress.zig");
 
-pub const Kind = enum { pull, update, remove, server, abliterate, setup, search };
+pub const Kind = enum { pull, update, remove, server, abliterate, setup, search, refresh };
 pub const State = enum { running, stopping, done, failed, cancelled };
 
 pub const Job = struct {

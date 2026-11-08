@@ -13,6 +13,7 @@ pub const term = @import("tui/term.zig");
 pub const tui_model = @import("tui/model.zig");
 pub const jobs = @import("tui/jobs.zig");
 pub const tui_state = @import("tui/state.zig");
+pub const tui_settings = @import("tui/settings_view.zig");
 pub const tui_draw = @import("tui/draw.zig");
 pub const tui_app = @import("tui/app.zig");
 pub const catalog_io = @import("catalog_io.zig");
