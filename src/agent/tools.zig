@@ -811,7 +811,20 @@ pub const CommandResult = struct {
 };
 
 pub fn runCommand(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, s: policy.Settings, argv: []const []const u8, use_sandbox: bool) !CommandResult {
-    const wrapped = if (use_sandbox) try bwrapArgv(arena, s, argv) else argv;
+    return runCommandWith(arena, gpa, io, s, argv, use_sandbox, &.{});
+}
+
+/// Package databases a package query reads (only the ones that exist are bound, read-only).
+pub fn pkgDbDirs(arena: std.mem.Allocator, io: std.Io) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "/var/lib/apt", "/var/lib/dpkg", "/var/cache/apt", "/var/lib/pacman", "/var/lib/rpm", "/var/cache/dnf", "/var/cache/yum", "/var/lib/dnf", "/lib/apk", "/var/cache/apk", "/var/cache/zypp", "/var/lib/zypp" }) |d| {
+        if (std.Io.Dir.cwd().access(io, d, .{})) |_| try out.append(arena, d) else |_| {}
+    }
+    return out.toOwnedSlice(arena);
+}
+
+pub fn runCommandWith(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, s: policy.Settings, argv: []const []const u8, use_sandbox: bool, extra_ro: []const []const u8) !CommandResult {
+    const wrapped = if (use_sandbox) try bwrapArgvWith(arena, s, extra_ro, argv) else argv;
     const cap: usize = @as(usize, s.max_output_kb) * 1024;
     const cwd: ?[]const u8 = if (use_sandbox) null else (if (s.dirs.len > 0) s.dirs[0] else null);
     const r = process.run(gpa, io, wrapped, s.timeout_s, cwd, cap + 4096);

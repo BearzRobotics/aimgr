@@ -256,8 +256,11 @@ pub fn handleCall(e: Env, st: *State, arena: std.mem.Allocator, s_in: policy.Set
                 },
                 .auto => {},
             }
-            try e.out.print("  [run_command] {s}  ({s}{s})\n", .{ shown, how, if (sandbox_on) ", sandboxed" else "" });
-            const r = try tools.runCommand(arena, e.gpa, e.io, s, argv, sandbox_on);
+            // Network commands (gh) were approved by the user and cannot work in the network-less sandbox.
+            const sb = sandbox_on and c.needs != .network;
+            try e.out.print("  [run_command] {s}  ({s}{s})\n", .{ shown, how, if (sb) ", sandboxed" else if (c.needs == .network) ", network" else "" });
+            const extra_ro: []const []const u8 = if (c.needs == .pkgdb) try tools.pkgDbDirs(arena, e.io) else &.{};
+            const r = try tools.runCommandWith(arena, e.gpa, e.io, s, argv, sb, extra_ro);
             return .{ .text = r.text, .decision = how, .reason = reason };
         },
         .search_files => {

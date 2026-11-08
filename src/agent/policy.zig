@@ -370,7 +370,7 @@ const read_only_cmds = [_][]const u8{
     "lscpu", "lspci", "lsusb", "locale",
 };
 const windows_read_only_cmds = [_][]const u8{ "where", "hostname", "whoami", "tasklist", "findstr", "fc", "systeminfo", "pdftotext", "pdfinfo", "jq" };
-const git_ok_sub = [_][]const u8{ "status", "log", "diff", "show", "branch", "ls-files", "rev-parse", "remote", "shortlog", "describe" };
+const git_ok_sub = [_][]const u8{ "status", "log", "diff", "show", "branch", "ls-files", "rev-parse", "remote", "shortlog", "describe", "blame", "grep", "ls-tree", "cat-file", "show-ref", "tag", "reflog", "whatchanged", "count-objects", "merge-base", "name-rev", "for-each-ref" };
 const find_bad_flags = [_][]const u8{ "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls" };
 
 fn inSet(set: []const []const u8, x: []const u8) bool {
@@ -386,7 +386,90 @@ pub const Command = struct {
     decision: Decision,
     /// Plain-language label shown to the user, e.g. "read-only command".
     kind: []const u8,
+    /// What the command needs beyond the normal sandbox: the package databases (read-only), or the network
+    /// (then it runs outside the network-less sandbox, and only after the user approved it).
+    needs: Needs = .none,
 };
+
+pub const Needs = enum { none, pkgdb, network };
+
+/// Package managers: only their query forms are read-only (search, info, list, which-package-owns-a-file).
+const pkg_cmds = [_][]const u8{ "apt", "apt-cache", "dpkg", "dpkg-query", "apk", "rpm", "dnf", "yum", "pacman", "zypper" };
+
+/// null = the query is read-only; otherwise why not.
+pub fn pkgQueryProblem(name: []const u8, argv: []const []const u8) ?[]const u8 {
+    if (argv.len < 2) return "needs a query (search, show/info, list)";
+    // Options that load other configuration, run hooks or point at another root are never automatic.
+    for (argv[1..]) |a| {
+        for ([_][]const u8{ "-o", "--option", "-c", "--config", "--setopt", "--installroot", "--root", "--dbpath", "--hookdir", "--pipe", "--eval", "-E", "--admindir", "--instdir", "--allow-untrusted", "--repo", "-X" }) |bad| {
+            if (std.mem.eql(u8, a, bad) or (bad.len > 2 and std.mem.startsWith(u8, a, bad) and a.len > bad.len and a[bad.len] == '=')) return "option changes configuration or runs other programs";
+            if (bad.len == 2 and bad[1] != '-' and std.mem.startsWith(u8, a, bad) and a.len > 2 and a[1] != '-' and (std.mem.eql(u8, bad, "-o") or std.mem.eql(u8, bad, "-c")) and (std.mem.eql(u8, name, "apt") or std.mem.eql(u8, name, "apt-cache") or std.mem.eql(u8, name, "dnf") or std.mem.eql(u8, name, "yum"))) return "option changes configuration";
+        }
+        if (std.mem.eql(u8, name, "rpm") and std.mem.indexOf(u8, a, "lua") != null) return "rpm query formats with Lua can run code";
+    }
+    const sub = argv[1];
+    const allowed: []const []const u8 = if (std.mem.eql(u8, name, "apt"))
+        &.{ "search", "show", "policy", "list", "depends", "rdepends", "madison" }
+    else if (std.mem.eql(u8, name, "apt-cache"))
+        &.{ "search", "show", "showpkg", "showsrc", "policy", "depends", "rdepends", "madison", "pkgnames", "stats" }
+    else if (std.mem.eql(u8, name, "dpkg") or std.mem.eql(u8, name, "dpkg-query"))
+        &.{ "-l", "-L", "-S", "-s", "-p", "-W", "--list", "--listfiles", "--search", "--status", "--print-avail", "--show", "--get-selections" }
+    else if (std.mem.eql(u8, name, "apk"))
+        &.{ "search", "info", "list", "policy", "dot" }
+    else if (std.mem.eql(u8, name, "dnf") or std.mem.eql(u8, name, "yum"))
+        &.{ "search", "info", "list", "provides", "whatprovides", "repoquery", "repolist", "deplist" }
+    else if (std.mem.eql(u8, name, "zypper"))
+        &.{ "search", "se", "info", "if", "packages", "pa", "patterns", "repos", "lr", "what-provides", "wp" }
+    else
+        &.{};
+    if (std.mem.eql(u8, name, "rpm")) {
+        // rpm -q* (query) and -V (verify) only.
+        if (std.mem.startsWith(u8, sub, "-q") or std.mem.eql(u8, sub, "--query") or std.mem.eql(u8, sub, "-V") or std.mem.eql(u8, sub, "--verify")) return null;
+        return "only rpm -q (query) and -V (verify) are read-only";
+    }
+    if (std.mem.eql(u8, name, "pacman")) {
+        // -Q... (local queries), -S with only s/i/l/g (search, info, list, groups), -F with l/x/o (file queries).
+        if (sub.len >= 2 and sub[0] == '-' and sub[1] == 'Q') return null;
+        const rest = if (sub.len >= 2) sub[2..] else "";
+        if (std.mem.startsWith(u8, sub, "-S") and rest.len > 0 and std.mem.indexOfNone(u8, rest, "sigl") == null) return null;
+        if (std.mem.startsWith(u8, sub, "-F") and rest.len > 0 and std.mem.indexOfNone(u8, rest, "lxoq") == null) return null;
+        return "only pacman -Q, -Ss/-Si/-Sl/-Sg and -Fl/-Fx/-Fo are read-only (no -Sy, no installs)";
+    }
+    for (allowed) |x| if (std.mem.eql(u8, sub, x)) return null;
+    return "only search / show / info / list queries are read-only (installing and removing need you)";
+}
+
+/// gh: read-only views. Everything gh does goes to GitHub over the network, so the caller still asks first.
+pub fn ghQueryProblem(argv: []const []const u8) ?[]const u8 {
+    if (argv.len < 2) return "gh needs a subcommand";
+    for (argv[1..]) |a| if (std.mem.eql(u8, a, "--web") or std.mem.eql(u8, a, "-w")) return "opens a browser";
+    const top = argv[1];
+    if (std.mem.eql(u8, top, "status")) return null;
+    if (std.mem.eql(u8, top, "search")) return null;
+    if (std.mem.eql(u8, top, "api")) {
+        for (argv[2..]) |a| for ([_][]const u8{ "-X", "--method", "-f", "-F", "--field", "--raw-field", "--input" }) |bad| {
+            if (std.mem.eql(u8, a, bad) or (std.mem.startsWith(u8, a, bad) and bad.len > 2 and a.len > bad.len and a[bad.len] == '=')) return "gh api with a method or fields can change things";
+        };
+        return null;
+    }
+    if (argv.len < 3) return "gh needs a subcommand";
+    const sub = argv[2];
+    const pairs = [_]struct { []const u8, []const []const u8 }{
+        .{ "repo", &.{ "view", "list" } },
+        .{ "issue", &.{ "list", "view", "status" } },
+        .{ "pr", &.{ "list", "view", "diff", "checks", "status" } },
+        .{ "release", &.{ "list", "view" } },
+        .{ "run", &.{ "list", "view" } },
+        .{ "workflow", &.{ "list", "view" } },
+        .{ "label", &.{"list"} },
+        .{ "gist", &.{ "list", "view" } },
+        .{ "auth", &.{"status"} },
+    };
+    for (pairs) |pr| if (std.mem.eql(u8, top, pr[0])) {
+        for (pr[1]) |ok| if (std.mem.eql(u8, sub, ok)) return null;
+    };
+    return "only gh view/list/status/diff/search/api-GET are read-only";
+}
 
 /// Classify an argv. `argv[0]` must be a bare command name (no slashes) to be auto-approvable.
 pub fn classifyCommand(arena: std.mem.Allocator, s: Settings, argv: []const []const u8) !Command {
@@ -404,6 +487,20 @@ pub fn classifyCommand(arena: std.mem.Allocator, s: Settings, argv: []const []co
     }
     if (inSet(&shell_like, name)) return .{ .decision = .{ .deny = "shell interpreters and command wrappers are not allowed; give one plain command per call" }, .kind = "shell" };
 
+    if (!has_slash and inSet(&pkg_cmds, name)) {
+        if (pkgQueryProblem(name, argv)) |why| {
+            if (s.level != .ask) return .{ .decision = .{ .deny = why }, .kind = "package manager" };
+            return .{ .decision = .{ .ask = "package manager command that is not a plain query" }, .kind = "package manager" };
+        }
+        return .{ .decision = .auto, .kind = "package query", .needs = .pkgdb };
+    }
+    if (!has_slash and std.mem.eql(u8, name, "gh")) {
+        if (ghQueryProblem(argv)) |why| {
+            if (s.level != .ask) return .{ .decision = .{ .deny = why }, .kind = "gh" };
+            return .{ .decision = .{ .ask = "gh command that can change things on GitHub" }, .kind = "gh", .needs = .network };
+        }
+        return .{ .decision = .{ .ask = "contacts GitHub over the network (read-only)" }, .kind = "gh query", .needs = .network };
+    }
     if (!has_slash and (inSet(if (is_windows) &windows_read_only_cmds else &read_only_cmds, name) or inSet(s.allow_commands, name) or std.mem.eql(u8, name, "git"))) {
         if (try readOnlyArgsOk(arena, s, name, argv)) |why_not| return why_not;
         return .{ .decision = .auto, .kind = "read-only command" };
@@ -427,6 +524,30 @@ fn readOnlyArgsOk(arena: std.mem.Allocator, s: Settings, name: []const u8, argv:
     if (std.mem.eql(u8, name, "git")) {
         if (argv.len < 2) return escalate(s.level, "git without a subcommand");
         if (!inSet(&git_ok_sub, argv[1])) return escalate(s.level, "git subcommand is not read-only");
+        // These read when listing but write when given a name.
+        const sub = argv[1];
+        const rest = argv[2..];
+        const listing_only = struct {
+            fn f(r: []const []const u8, ok_flags: []const []const u8) bool {
+                for (r) |a| {
+                    var fine = false;
+                    for (ok_flags) |o| if (std.mem.eql(u8, a, o) or (std.mem.startsWith(u8, a, o) and o.len > 2 and a.len > o.len and a[o.len] == '=')) {
+                        fine = true;
+                    };
+                    if (!fine) return false;
+                }
+                return true;
+            }
+        }.f;
+        if (std.mem.eql(u8, sub, "branch") and !listing_only(rest, &.{ "-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "-l", "--show-current", "--contains", "--merged", "--no-merged", "--sort", "--format", "--color", "--no-color" }))
+            return escalate(s.level, "git branch with a name creates, renames or deletes a branch");
+        if (std.mem.eql(u8, sub, "tag") and !listing_only(rest, &.{ "-l", "--list", "-n", "--sort", "--contains", "--merged", "--points-at", "--format" }))
+            return escalate(s.level, "git tag with a name creates or deletes a tag");
+        if (std.mem.eql(u8, sub, "remote") and rest.len > 0 and !(std.mem.eql(u8, rest[0], "-v") or std.mem.eql(u8, rest[0], "show") or std.mem.eql(u8, rest[0], "get-url")))
+            return escalate(s.level, "git remote can add, change or remove remotes");
+        if (std.mem.eql(u8, sub, "reflog") and rest.len > 0 and !(std.mem.eql(u8, rest[0], "show") or rest[0][0] == '-'))
+            return escalate(s.level, "git reflog expire/delete rewrites history");
+        if (std.mem.eql(u8, sub, "show") and rest.len == 0) {} // fine
         for (argv[2..]) |a| {
             if (std.mem.startsWith(u8, a, "-c") or std.mem.startsWith(u8, a, "--exec") or std.mem.startsWith(u8, a, "--output") or std.mem.indexOf(u8, a, "ext-diff") != null or std.mem.indexOf(u8, a, "textconv") != null or std.mem.startsWith(u8, a, "--upload-pack") or std.mem.startsWith(u8, a, "--git-dir") or std.mem.startsWith(u8, a, "--work-tree"))
                 return escalate(s.level, "git option can run programs or write files");
@@ -671,6 +792,48 @@ test "basic text commands, and their file-writing forms" {
     try expectDeny(try cmd(a, s, "uniq /stuff/Books/in /stuff/Books/out"));
     try expectDeny(try cmd(a, s, "pdftotext /stuff/Books/a.pdf /stuff/Books/a.txt"));
     try expectDeny(try cmd(a, s, "pdftotext /stuff/Books/a.pdf"));
+}
+
+test "package manager queries are read-only, installs are not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = testSettings(.inspect);
+    for ([_][]const u8{ "apt search tesseract", "apt show poppler-utils", "apt-cache policy git", "dpkg -S /usr/bin/pdftotext", "dpkg -l", "apk search ocr", "apk info -L busybox", "rpm -qf /usr/bin/ls", "rpm -qa", "dnf search tesseract", "dnf provides pdftotext", "yum info git", "pacman -Ss tesseract", "pacman -Si poppler", "pacman -Qo /usr/bin/ls", "pacman -Fl poppler", "zypper se tesseract", "apt search lua" }) |q| {
+        const c = try cmd(a, s, q);
+        try expectAuto(c);
+        try std.testing.expectEqual(Needs.pkgdb, c.needs);
+    }
+    for ([_][]const u8{ "apt install tesseract-ocr", "apt-get install x", "apt update", "dpkg -i x.deb", "apk add x", "rpm -i x.rpm", "rpm -e x", "rpm -q --pipe sh", "rpm -q --qf '%{lua:os.execute()}'", "dnf install x", "dnf search x --setopt=a=b", "pacman -S x", "pacman -Sy", "pacman -Syu", "pacman -R x", "pacman -Fy", "zypper install x", "apt -o APT::Update::Pre-Invoke::=x search y", "apt search x -c /tmp/evil.conf" }) |q| {
+        try expectDeny(try cmd(a, s, q));
+    }
+    // at level ask the same installs become approvals
+    try expectAsk(try cmd(a, testSettings(.ask), "apt install tesseract-ocr"));
+}
+
+test "gh: read-only views ask (network), changes are not automatic" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = testSettings(.inspect);
+    const v = try cmd(a, s, "gh pr list");
+    try expectAsk(v);
+    try std.testing.expectEqual(Needs.network, v.needs);
+    try expectAsk(try cmd(a, s, "gh repo view BearzRobotics/aimgr"));
+    try expectAsk(try cmd(a, s, "gh api repos/BearzRobotics/aimgr/releases"));
+    try expectDeny(try cmd(a, s, "gh pr merge 3"));
+    try expectDeny(try cmd(a, s, "gh api -X DELETE repos/x/y"));
+    try expectDeny(try cmd(a, s, "gh issue create"));
+    try expectDeny(try cmd(a, s, "gh repo view --web"));
+}
+
+test "git: listing forms only" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = testSettings(.inspect);
+    for ([_][]const u8{ "git branch -a", "git branch", "git tag -l", "git remote -v", "git blame README.md", "git grep needle", "git ls-tree HEAD", "git reflog" }) |q| try expectAuto(try cmd(a, s, q));
+    for ([_][]const u8{ "git branch evil", "git branch -D main", "git tag v9", "git remote add x y", "git remote remove origin", "git reflog expire --all", "git commit -m x", "git push" }) |q| try expectDeny(try cmd(a, s, q));
 }
 
 test "dangerous flags on allowlisted commands" {
