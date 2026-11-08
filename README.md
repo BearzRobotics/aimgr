@@ -1,7 +1,7 @@
 # aimgr
 
 Local AI model manager for **Ollama** and the **llama** distribution of llama.cpp.
-Linux, Zig 0.17.1, no system libraries. See `docs/manpages/aimgr.1.md` for the full reference
+Linux and Windows, Zig 0.17.1, no system libraries. See `docs/manpages/aimgr.1.md` for the full reference
 and `ai/SPEC.md` for the requirements.
 
 ```
@@ -14,7 +14,22 @@ zig build -Doptimize=ReleaseSafe
 Highlights: a ~150-model bundled catalog with access (open / sign-in / cloud) and good-for tags, `aimgr browse`, `aimgr list --fit`, `aimgr hardware`, `aimgr search`, `aimgr chat|serve|pull|update|remove`,
 `aimgr agent` (let a tool-capable local model inspect a directory under strict, per-model guardrails), `aimgr abliterate` (create an abliterated copy of a model).
 
-Vendored, pinned sources (no network at build time): `vendor/toml-zig`, `vendor/libvaxis`,
-`vendor/uucode`, `vendor/llama-convert` (see each `VENDORED.txt`). Design decisions: `docs/decisions/`.
+## Agent sessions
 
-License: GPL-2.0-only (see `LICENSE`). Vendored components keep their own MIT licenses.
+`aimgr agent <ollama|llama> <model>` (or `g` in the TUI) works in the current folder after you trust it once.
+Like Claude Code: `AIMGR.md` / `AGENTS.md` / `CLAUDE.md` project notes, approvals with `y` / `a` (always this
+session), `/mode` (default, edits, plan), `/add-dir`, `/compact`, `/status`, `/rules`, `!command` to run your own
+command, Markdown replies, PDF reading (with OCR via tesseract), read-only package queries (apt, dnf, pacman, apk,
+rpm, zypper, winget), git and gh. Per-model level, sandbox, shell and web are set in the TUI Settings tab.
+
+## Windows
+
+`zig build -Dtarget=x86_64-windows`, or use the release zip. `aimgr setup-backends` downloads Ollama (official
+release, SHA-256 pinned) into aimgr's own folder; no admin rights needed. The agent uses PowerShell 5.1 by default
+(`pwsh` and `cmd` are options). Windows has no sandbox, so every command the model runs is shown and approved.
+Not on Windows yet: scheduled agent runs, llama.cpp download, abliteration.
+
+Vendored, pinned sources (no network at build time): `vendor/toml-zig`, `vendor/libvaxis`,
+`vendor/uucode`, `vendor/llama-convert`, `vendor/md-zig` (see each `VENDORED.txt`). Design decisions: `docs/decisions/`.
+
+License: GPL-2.0-only (see `LICENSE`). Vendored components keep their own licenses.

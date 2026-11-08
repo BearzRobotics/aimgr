@@ -1,5 +1,6 @@
 pub const backend = @import("backend.zig");
 pub const process = @import("process.zig");
+pub const version = "0.1.0";
 pub const mcp = @import("mcp.zig");
 pub const setup_backends = @import("setup_backends.zig");
 pub const platform = @import("platform.zig");

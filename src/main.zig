@@ -3,7 +3,7 @@ const aimgr = @import("aimgr");
 const inv = aimgr.inventory;
 
 const usage =
-    \\aimgr - local AI model manager (milestone 5: TUI)
+    \\aimgr - local AI model manager
     \\
     \\usage: aimgr <command>
     \\
@@ -61,6 +61,11 @@ pub fn main(init: std.process.Init) !u8 {
 
     const interactive = std.Io.File.stdout().isTty(io) catch false;
     const cmd = if (args.len > 1) args[1] else if (interactive) "tui" else "help";
+    if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "version")) {
+        try out.print("aimgr {s} ({s}-{s})\n", .{ aimgr.version, @tagName(@import("builtin").cpu.arch), @tagName(@import("builtin").os.tag) });
+        try out.flush();
+        return 0;
+    }
     var code: u8 = 0;
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         try out.writeAll(usage);

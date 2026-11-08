@@ -394,7 +394,7 @@ pub const Command = struct {
 pub const Needs = enum { none, pkgdb, network };
 
 /// Package managers: only their query forms are read-only (search, info, list, which-package-owns-a-file).
-const pkg_cmds = [_][]const u8{ "apt", "apt-cache", "dpkg", "dpkg-query", "apk", "rpm", "dnf", "yum", "pacman", "zypper" };
+const pkg_cmds = [_][]const u8{ "apt", "apt-cache", "dpkg", "dpkg-query", "apk", "rpm", "dnf", "yum", "pacman", "zypper", "winget" };
 
 /// null = the query is read-only; otherwise why not.
 pub fn pkgQueryProblem(name: []const u8, argv: []const []const u8) ?[]const u8 {
@@ -418,6 +418,8 @@ pub fn pkgQueryProblem(name: []const u8, argv: []const []const u8) ?[]const u8 {
         &.{ "search", "info", "list", "policy", "dot" }
     else if (std.mem.eql(u8, name, "dnf") or std.mem.eql(u8, name, "yum"))
         &.{ "search", "info", "list", "provides", "whatprovides", "repoquery", "repolist", "deplist" }
+    else if (std.mem.eql(u8, name, "winget"))
+        &.{ "search", "find", "show", "view", "list", "ls" }
     else if (std.mem.eql(u8, name, "zypper"))
         &.{ "search", "se", "info", "if", "packages", "pa", "patterns", "repos", "lr", "what-provides", "wp" }
     else
@@ -492,6 +494,9 @@ pub fn classifyCommand(arena: std.mem.Allocator, s: Settings, argv: []const []co
             if (s.level != .ask) return .{ .decision = .{ .deny = why }, .kind = "package manager" };
             return .{ .decision = .{ .ask = "package manager command that is not a plain query" }, .kind = "package manager" };
         }
+        // winget search/show query online sources: asked first (nothing leaves the machine without approval).
+        if (std.mem.eql(u8, name, "winget") and !(std.mem.eql(u8, argv[1], "list") or std.mem.eql(u8, argv[1], "ls")))
+            return .{ .decision = .{ .ask = "winget contacts its online sources (read-only search)" }, .kind = "package query", .needs = .network };
         return .{ .decision = .auto, .kind = "package query", .needs = .pkgdb };
     }
     if (!has_slash and std.mem.eql(u8, name, "gh")) {
@@ -807,6 +812,13 @@ test "package manager queries are read-only, installs are not" {
     for ([_][]const u8{ "apt install tesseract-ocr", "apt-get install x", "apt update", "dpkg -i x.deb", "apk add x", "rpm -i x.rpm", "rpm -e x", "rpm -q --pipe sh", "rpm -q --qf '%{lua:os.execute()}'", "dnf install x", "dnf search x --setopt=a=b", "pacman -S x", "pacman -Sy", "pacman -Syu", "pacman -R x", "pacman -Fy", "zypper install x", "apt -o APT::Update::Pre-Invoke::=x search y", "apt search x -c /tmp/evil.conf" }) |q| {
         try expectDeny(try cmd(a, s, q));
     }
+    // winget: list is local; search/show go online (asked); installs are not queries
+    try expectAuto(try cmd(a, s, "winget list"));
+    try expectAsk(try cmd(a, s, "winget search tesseract"));
+    try expectAsk(try cmd(a, s, "winget show UB-Mannheim.TesseractOCR"));
+    try expectDeny(try cmd(a, s, "winget install UB-Mannheim.TesseractOCR"));
+    try expectDeny(try cmd(a, s, "winget upgrade --all"));
+    try expectDeny(try cmd(a, s, "winget export -o x.json"));
     // at level ask the same installs become approvals
     try expectAsk(try cmd(a, testSettings(.ask), "apt install tesseract-ocr"));
 }
