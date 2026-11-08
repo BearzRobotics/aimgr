@@ -13,6 +13,7 @@ const tools = @import("agent/tools.zig");
 const run = @import("agent/run.zig");
 const chat = @import("agent/chat.zig");
 const llama_server = @import("agent/llama_server.zig");
+const capcache = @import("agent/capcache.zig");
 const hardware = @import("hardware.zig");
 
 pub const usage =
@@ -252,7 +253,9 @@ pub fn main(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
         return 1;
     };
     defer srv.stop(gpa, io);
-    switch (llama_server.supportsTools(arena, gpa, io, srv.port) orelse false) {
+    const checked = llama_server.supportsTools(arena, gpa, io, srv.port);
+    if (checked) |v| capcache.record(arena, gpa, io, env, .llama, id, v); // remembered for the Settings tab
+    switch (checked orelse false) {
         true => {},
         false => {
             try err.print("aimgr: this model's chat template does not support tool calls, so it cannot be used in agent mode. Pick a model tagged [tools] in 'aimgr list'.\n", .{});

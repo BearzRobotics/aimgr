@@ -459,14 +459,21 @@ fn drawSettingsLists(app: *App, a: std.mem.Allocator, cols: usize, top: usize, h
                 }
                 if (y + 1 >= h) break;
                 const params = if (ag.params_b) |p| try std.fmt.allocPrint(a, "{d:.1}B", .{p}) else "?";
-                const id_w: usize = 34;
+                const id_w: usize = 27;
                 const id_shown = if (ag.id.len <= id_w) ag.id else try std.fmt.allocPrint(a, "{s}...", .{ag.id[0 .. id_w - 3]});
-                const prefix = try std.fmt.allocPrint(a, "{s}{s}", .{ if (picked) "> " else "  ", try padRight(a, id_shown, id_w) });
+                const prefix = try std.fmt.allocPrint(a, "{s}{s:<6} {s}", .{ if (picked) "> " else "  ", ag.backend.name(), try padRight(a, id_shown, id_w) });
+                const tools_txt: []const u8 = switch (ag.tools) {
+                    .reported => "tools: yes",
+                    .verified_yes => "tools: verified",
+                    .verified_no => "NO tools (verified)",
+                    .catalog_hint => "tools: hint",
+                    .unknown => "tools: ?",
+                };
                 const line = try std.fmt.allocPrint(a, "{s} level {s:<9} {s}  {s}", .{
                     prefix,
                     ag.level.text(),
-                    if (ag.custom) "(yours)" else try std.fmt.allocPrint(a, "(default for {s})", .{params}),
-                    if (ag.stored_dirs) |d| (if (d.len > 0) try std.fmt.allocPrint(a, "dirs: {s}", .{d[0]}) else "") else "dir asked at start",
+                    if (ag.custom) "(yours)" else try std.fmt.allocPrint(a, "(default {s})", .{params}),
+                    tools_txt,
                 });
                 term.setAttr(if (picked) term.A_REVERSE else 0);
                 term.put(top + y, 1, cols, line);

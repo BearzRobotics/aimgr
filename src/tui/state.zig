@@ -10,6 +10,7 @@ const catalog = @import("../catalog.zig");
 const discover = @import("../discover.zig");
 const agent_settings = @import("../agent/settings.zig");
 const settings_view = @import("settings_view.zig");
+const capcache = @import("../agent/capcache.zig");
 
 pub const Target = struct { backend: backend.Kind, id: []const u8 };
 
@@ -44,6 +45,8 @@ pub const App = struct {
     report: inventory.Inventory = undefined,
     loaded: catalog_io.Loaded = .{},
     rows: []model.Row = &.{},
+    /// Verified tool support of llama models (from earlier agent sessions).
+    tool_caps: capcache.Map = .empty,
     /// Stored per-model agent settings (rebuilt on refresh).
     agent_entries: []const agent_settings.Entry = &.{},
     /// `ollama show` facts for installed Ollama models (rebuilt on refresh).
@@ -115,6 +118,6 @@ pub const App = struct {
     pub fn settingsItems(self: *const App, arena: std.mem.Allocator) ![]settings_view.Item {
         var models: std.ArrayList(backend.Model) = .empty;
         for (self.report.reports) |r| try models.appendSlice(arena, r.models orelse &.{});
-        return settings_view.items(arena, self.loaded.sources, models.items, &self.infos, self.agent_entries);
+        return settings_view.items(arena, self.loaded.sources, models.items, &self.infos, self.agent_entries, &self.loaded.cat, &self.tool_caps);
     }
 };

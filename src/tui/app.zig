@@ -21,6 +21,7 @@ const abl = @import("../abliterate.zig");
 const hardware = @import("../hardware.zig");
 const agent_policy = @import("../agent/policy.zig");
 const settings_view = @import("settings_view.zig");
+const capcache = @import("../agent/capcache.zig");
 const sources_mod = @import("../sources.zig");
 const modelinfo = @import("../modelinfo.zig");
 
@@ -110,6 +111,7 @@ pub fn refresh(app: *App) void {
     app.loaded = catalog_io.loadAll(a, app.gpa, app.io, app.environ) catch .{};
     app.hw = hardware.detect(a, app.gpa, app.io) catch .{ .mem = .{}, .gpus = &.{} };
     app.agent_entries = sources_io.loadAgents(a, app.gpa, app.io, app.environ) catch &.{};
+    app.tool_caps = capcache.load(a, app.gpa, app.io, app.environ);
     app.infos = .empty;
     var asked: usize = 0;
     for (app.report.reports) |r| {
@@ -482,7 +484,10 @@ fn chat(app: *App) void {
     ew.interface.flush() catch {};
     term.resumeTerm();
     installSignals(); // runChat reset the handlers to default
-    if (code == 0) app.setMessage(false, "chat ended", .{}) else app.setMessage(true, "chat exited with code {d}", .{code});
+    const can_tools = if (row.info) |i| i.hasCap("tools") else false;
+    if (code == 0) {
+        if (can_tools) app.setMessage(false, "chat ended. This model can also use tools: press g to let it look at a directory (plain chat has no tools)", .{}) else app.setMessage(false, "chat ended", .{});
+    } else app.setMessage(true, "chat exited with code {d}", .{code});
 }
 
 // ---- abliteration -------------------------------------------------------
@@ -733,10 +738,12 @@ fn settingsActivate(app: *App) void {
             var entries: std.ArrayList(agent_settings.Entry) = .empty;
             entries.appendSlice(fa, app.agent_entries) catch return;
             const next = settings_view.nextLevel(ag.level);
+            if (ag.tools == .verified_no) return app.setMessage(true, "this model's chat template does not support tool calls (verified), so there is nothing to tune", .{});
             const model_id = fa.dupe(u8, ag.id) catch return; // ag.id lives in the arena refresh() frees
-            if (agent_settings.find(entries.items, .ollama, model_id)) |k| {
+            const be = ag.backend;
+            if (agent_settings.find(entries.items, be, model_id)) |k| {
                 entries.items[k].level = next;
-            } else entries.append(fa, .{ .backend = .ollama, .id = model_id, .level = next }) catch return;
+            } else entries.append(fa, .{ .backend = be, .id = model_id, .level = next }) catch return;
             sources_io.saveAgents(fa, app.gpa, app.io, app.environ, entries.items) catch |e| return app.setMessage(true, "could not save the config: {s}", .{@errorName(e)});
             refresh(app);
             app.setMessage(false, "agent level for {s}: {s}{s}", .{ model_id, next.text(), switch (next) {

@@ -92,3 +92,21 @@ interpreters and wrappers.
 - No streaming: the reply appears when complete. Context is `num_ctx = 8192` for the session.
 - Prompt-injection resistance is structural (output cannot approve or change settings), not a promise that a model
   will never be misled into asking for something unwise; every non-read-only action still needs the user.
+
+## Tools added 2026-11-08: search_files, edit_file, move_file, make_dir, delete_file
+- `search_files` (read tiers): literal substring search under an allowed directory; skips symlinks, binary files,
+  files that look like secrets and `.git`; caps on results, files, depth and bytes per file.
+- Mutating tools exist only at level `ask` and each one prints what will happen and waits for `y`:
+  `edit_file` needs old_text to match exactly once (or replace_all), shows `- old / + new`, writes in place;
+  `move_file` resolves both ends inside the allowed directories and refuses to overwrite; `make_dir` stays
+  inside them; `delete_file` removes one regular file (not directories, not symlinks). All go through
+  `policy.classifyWrite` (inside the directories, not secret-looking names). Tools not allowed at a level are
+  not offered and are also denied by name if called.
+- Verified live (gemma4:12b, scratch dir): search automatic; edit applied after y and the file changed; move and
+  mkdir applied after y; delete declined and the file kept; each logged in the audit log. Unit tests cover
+  edit semantics, previews, schemas per level, and real search/move/mkdir/delete on a temp directory.
+
+## Settings tab and the capability cache
+llama models are listed with how their tool support is known: verified (cached from a real /props check,
+`$XDG_STATE_HOME/aimgr/agent-capabilities.json`), catalog hint, or unknown (checked at start). A verified "no"
+defaults to level off and cannot be raised from the Settings tab.
