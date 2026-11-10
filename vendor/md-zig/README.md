@@ -32,6 +32,19 @@ with `error.InputTooLarge` or `error.LineTooLong`. The tree (`doc.root`,
 `md.Node`, walked iteratively with `md.Walker`) is public, for consumers that
 build their own output, such as a GTK viewer.
 
+Write it back out as Markdown (edit the tree, then save):
+
+```zig
+try doc.writeMarkdown(gpa, writer);          // or doc.toMarkdownAlloc(gpa)
+```
+
+The output has the same meaning, not the same spelling: parsing it gives a tree
+that renders to the same HTML (checked on all 652 CommonMark and 52 GFM
+examples). Raw HTML, and so `<!-- comments -->`, and front matter are written
+back exactly as read. Headings come out ATX, code fenced, links inline (reference
+definitions are resolved and not written), emphasis as `_x_`/`**x**`. Nesting
+deeper than 200 fails with `error.TooDeep`.
+
 Try it: `zig build` then `zig-out/bin/mdcat FILE [WIDTH]`.
 
 ## C interface (experimental)
@@ -67,6 +80,8 @@ if (md_parse(src, len, MD_EXT_ALL, &doc) == MD_OK) {
 `Extensions.gfm` is the first five; `Extensions.all` is all of them.
 
 ## Not done
+
+- The Markdown writer does not keep how a construct was spelled (setext vs ATX, `*` vs `_`, reference-style links, indented code, wrapping).
 
 - A blank line between a term and its `: definition` (the `:` line must follow the term directly).
 - Unicode: "punctuation" and "whitespace" for emphasis, and case folding of link

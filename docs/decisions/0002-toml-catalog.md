@@ -3,8 +3,8 @@
 Status: accepted. Date: 2026-11-07.
 
 ## Decisions
-- TOML parsing uses `toml-zig` v0.1.0 (github.com/BearzRobotics/toml-zig, MIT,
-  tarball hash `toml-0.1.0-dDatLI4xAgB1P1SWnx8mnn9oHfDkYSZbqBMOKvKR-X3N`),
+- TOML parsing uses `toml-zig` v0.2.0 (github.com/BearzRobotics/toml-zig, MIT,
+  tarball hash `toml-0.2.0-dDatLIhiAgBq8q4SLFu0RZSUcCJLAwl49UZRIZ-fHqqx`),
   vendored in `vendor/toml-zig` and referenced as a path dependency, so builds
   never fetch from the network (SPEC section 5).
 - Catalog schema: `[[model]]` tables with `backend`, `id`, and optional `name`,

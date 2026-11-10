@@ -7,6 +7,7 @@ const http = @import("http.zig");
 const sources = @import("sources.zig");
 const agent_settings = @import("agent/settings.zig");
 const schedule = @import("schedule.zig");
+const toml = @import("toml");
 
 pub const Loaded = struct {
     list: []sources.Source,
@@ -36,6 +37,8 @@ pub fn load(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *
 const Extras = struct {
     agents: []agent_settings.Entry = &.{},
     schedules: []schedule.Entry = &.{},
+    /// The file's current text, for its comments.
+    old: ?[]const u8 = null,
 };
 
 fn readExtras(arena: std.mem.Allocator, io: std.Io, path: []const u8) Extras {
@@ -43,22 +46,89 @@ fn readExtras(arena: std.mem.Allocator, io: std.Io, path: []const u8) Extras {
     return .{
         .agents = agent_settings.parse(arena, arena, old) catch &.{},
         .schedules = schedule.parse(arena, arena, old) catch &.{},
+        .old = old,
     };
 }
 
-fn compose(arena: std.mem.Allocator, list: []const sources.Source, agents: []const agent_settings.Entry, schedules: []const schedule.Entry) ![]u8 {
-    return std.mem.concat(arena, u8, &.{
+fn compose(arena: std.mem.Allocator, list: []const sources.Source, agents: []const agent_settings.Entry, schedules: []const schedule.Entry, old_text: ?[]const u8) ![]const u8 {
+    const fresh = try std.mem.concat(arena, u8, &.{
         try sources.serialize(arena, list),
         try agent_settings.serialize(arena, agents),
         try schedule.serialize(arena, schedules),
     });
+    return if (old_text) |o| carryComments(arena, o, fresh) else fresh;
+}
+
+/// The comments of the file being replaced, put back on the text just generated: each `[[source]]`,
+/// `[[agent]]` and `[[schedule]]` table keeps the comments above it and on its keys (matched by `id`),
+/// and the comments at the end of the file stay. A file that cannot be parsed is replaced as it is.
+pub fn carryComments(arena: std.mem.Allocator, old_text: []const u8, fresh: []const u8) []const u8 {
+    var old = toml.Document.parse(arena, old_text, .{}, null) catch return fresh;
+    defer old.deinit();
+    var new = toml.Document.parse(arena, fresh, .{}, null) catch return fresh;
+    defer new.deinit();
+    for (new.root.entries.keys(), new.root.entries.values()) |name, nv| {
+        const na = switch (nv) {
+            .array => |a| a,
+            else => continue,
+        };
+        const ov = old.root.get(name) orelse continue;
+        const oa = switch (ov) {
+            .array => |a| a,
+            else => continue,
+        };
+        for (na.items.items) |ni| {
+            if (ni != .table) continue;
+            const nt = ni.table;
+            const id = nt.getString("id") orelse continue;
+            for (oa.items.items) |oi| {
+                if (oi != .table) continue;
+                const ot = oi.table;
+                const oid = ot.getString("id") orelse continue;
+                if (!std.mem.eql(u8, oid, id)) continue;
+                nt.header = ot.header;
+                for (nt.entries.keys()) |k| {
+                    if (ot.commentsOf(k)) |c| nt.setComments(new.allocator(), k, c) catch return fresh;
+                }
+                break;
+            }
+        }
+    }
+    new.root.footer = old.root.footer;
+    return new.toOwnedString(arena) catch fresh;
+}
+
+test "comments in the old file stay on the tables they were written on" {
+    var a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer a.deinit();
+    const old =
+        \\# my notes
+        \\
+        \\# the local one
+        \\[[source]]
+        \\id = "mine"
+        \\kind = "catalog-file"
+        \\enabled = true # temporarily on
+        \\location = "/tmp/m.toml"
+        \\
+        \\# last words
+        \\
+    ;
+    const list = [_]sources.Source{.{ .id = "mine", .kind = .catalog_file, .enabled = false, .location = "/tmp/m.toml" }};
+    const out = try compose(a.allocator(), &list, &.{}, &.{}, old);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# the local one\n[[source]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "enabled = false # temporarily on") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "# last words\n"));
+    // A file that is not valid TOML is simply replaced.
+    const plain = try compose(a.allocator(), &list, &.{}, &.{}, "[[[");
+    try std.testing.expect(std.mem.indexOf(u8, plain, "enabled = false") != null);
 }
 
 /// Atomic replace (temp file + rename). Creates the config directory if needed. Existing [[agent]] and
 /// [[schedule]] tables in the file are preserved.
 pub fn save(arena: std.mem.Allocator, io: std.Io, path: []const u8, list: []const sources.Source) !void {
     const ex = readExtras(arena, io, path);
-    try writeAtomic(arena, io, path, try compose(arena, list, ex.agents, ex.schedules));
+    try writeAtomic(arena, io, path, try compose(arena, list, ex.agents, ex.schedules, ex.old));
 }
 
 /// Replace the [[agent]] tables, keeping sources and schedules as they are.
@@ -66,7 +136,7 @@ pub fn saveAgents(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, 
     const loaded = try load(arena, gpa, io, env);
     const path = loaded.path orelse return error.NoConfigDir;
     const ex = readExtras(arena, io, path);
-    try writeAtomic(arena, io, path, try compose(arena, loaded.list, entries, ex.schedules));
+    try writeAtomic(arena, io, path, try compose(arena, loaded.list, entries, ex.schedules, ex.old));
 }
 
 /// Replace the [[schedule]] tables, keeping sources and agent settings as they are.
@@ -74,7 +144,7 @@ pub fn saveSchedules(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.I
     const loaded = try load(arena, gpa, io, env);
     const path = loaded.path orelse return error.NoConfigDir;
     const ex = readExtras(arena, io, path);
-    try writeAtomic(arena, io, path, try compose(arena, loaded.list, ex.agents, entries));
+    try writeAtomic(arena, io, path, try compose(arena, loaded.list, ex.agents, entries, ex.old));
 }
 
 pub fn loadSchedules(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]schedule.Entry {

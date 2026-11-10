@@ -1,2 +1,2 @@
-md-zig v0.3.0 (BearzRobotics/md-zig), commit d358aea3bc8e322092abd2c9b35e994dd99af704
+md-zig v0.4.0 (BearzRobotics/md-zig), commit 047cdae58b8daad15cc7fd132c072708dd04fc57
 Used to render the model's Markdown replies in agent sessions (terminal text, optional ANSI).

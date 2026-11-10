@@ -1,7 +1,7 @@
 .{
     .name = .md,
     .fingerprint = 0xdb55a25461cb5257,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src", "ai", "docs", "scripts", "include", "test", "LICENSE", "README.md" },

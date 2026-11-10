@@ -21,6 +21,7 @@ pub const Walker = ast.Walker;
 pub const Event = ast.Event;
 pub const html = @import("html.zig");
 pub const term = @import("term.zig");
+pub const markdown = @import("markdown.zig");
 pub const TextOptions = term.TextOptions;
 const block = @import("block.zig");
 
@@ -94,6 +95,23 @@ pub const Document = struct {
         try html.write(gpa, self.root, &self.footnotes, self.extensions, w);
     }
 
+    /// Writes the document as Markdown (see `markdown.zig`: the meaning and the
+    /// raw HTML, including comments, are kept; the spelling is normalised).
+    pub fn writeMarkdown(self: *const Document, gpa: Allocator, w: *Io.Writer) markdown.Error!void {
+        try markdown.write(gpa, self.root, self.extensions, w);
+    }
+
+    /// The document as Markdown in memory, owned by the caller.
+    pub fn toMarkdownAlloc(self: *const Document, gpa: Allocator) (Allocator.Error || error{TooDeep})![]u8 {
+        var out: Io.Writer.Allocating = .init(gpa);
+        errdefer out.deinit();
+        self.writeMarkdown(gpa, &out.writer) catch |e| switch (e) {
+            error.WriteFailed => return error.OutOfMemory,
+            else => |other| return other,
+        };
+        return out.toOwnedSlice();
+    }
+
     /// Writes the document as text for a terminal (see `TextOptions`).
     pub fn writeText(self: *const Document, gpa: Allocator, w: *Io.Writer, options: TextOptions) term.Error!void {
         try term.write(gpa, self.root, &self.footnotes, options, w);
@@ -137,6 +155,7 @@ fn feedLine(parser: *block.Parser, a: Allocator, raw: []const u8) Allocator.Erro
 
 test {
     _ = @import("text.zig");
+    _ = @import("markdown_tests.zig");
     _ = @import("scan.zig");
     _ = @import("tests.zig");
     _ = @import("io_tests.zig");

@@ -1,6 +1,6 @@
 # toml-zig
 
-TOML 1.1.0 (and 1.0.0) parser and writer for Zig 0.17, with no dependencies. It reads from any `std.Io.Reader` and writes to any `std.Io.Writer`, and never needs the whole input in memory. See `ai/SPEC.md` for requirements and known deviations (notably: comments are not preserved when writing).
+TOML 1.1.0 (and 1.0.0) parser and writer for Zig 0.17, with no dependencies. It reads from any `std.Io.Reader` and writes to any `std.Io.Writer`, and never needs the whole input in memory. See `ai/SPEC.md` for requirements and known deviations (comments are preserved when writing, except inside arrays and inline tables).
 
 ```zig
 // build.zig.zon: .toml = .{ .path = "../toml-zig" }
@@ -16,6 +16,7 @@ var doc2 = try toml.Document.parseReader(gpa, &reader.interface, .{}, &diag);
 var doc3 = try toml.Document.parse(gpa, text, .{ .version = .v1_0 }, &diag);
 ```
 
+- Comments: `# ...` lines above a key or header, a trailing `# ...` on its line, blank lines between them and a closing footer are kept through parse → edit → write (`Table.key_comments`, `Table.header`, `Table.footer`). Set them with `doc.setComments(&.{"panel","position"}, .{ .before = &.{"# where it sits"}, .after = "# top|bottom" })`.
 - `docs/writing-toml.md` — a short guide to the syntax, with links to the official specification.
 - `docs/decisions/` — design decisions (e.g. why the parser is streaming).
 - `zig build bench` — parse/write timings (ReleaseFast).

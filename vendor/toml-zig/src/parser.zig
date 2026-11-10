@@ -17,6 +17,7 @@ const value = @import("value.zig");
 const Value = value.Value;
 const Table = value.Table;
 const Array = value.Array;
+const Comments = value.Comments;
 const Datetime = value.Datetime;
 
 /// Errors that do not depend on where the bytes come from.
@@ -89,6 +90,7 @@ pub fn parse(gpa: Allocator, arena: Allocator, root: *Table, r: *Io.Reader, opti
         .options = options,
     };
     defer p.scratch.deinit(gpa);
+    defer p.pending.deinit(gpa);
     if (try p.s.peekAt(0) == 0xEF and try p.s.peekAt(1) == 0xBB and try p.s.peekAt(2) == 0xBF) {
         for (0..3) |_| try p.s.bump();
     }
@@ -207,6 +209,13 @@ const Parser = struct {
     /// Text being assembled: bare keys, string bodies, scalar tokens.
     scratch: std.ArrayList(u8) = .empty,
     depth: u32 = 0,
+    /// Comment and blank lines seen since the last item; they become the
+    /// `before` of the next one. Lines are arena-owned, the list is not.
+    pending: std.ArrayList([]const u8) = .empty,
+    /// Comment after the item just parsed, on its own line.
+    trailing: ?[]const u8 = null,
+    /// Has any item been parsed yet? Blank lines before the first one are dropped.
+    seen_item: bool = false,
 
     fn err(self: *Parser, msg: []const u8) Error {
         return self.s.fail(self.s.loc(), msg, error.Syntax);
@@ -259,7 +268,14 @@ const Parser = struct {
 
     /// Comment body: any char except control characters other than tab (ABNF `non-eol`).
     fn skipComment(self: *Parser) ReadError!void {
+        return self.readComment(false);
+    }
+
+    /// Like `skipComment`; with `keep` the comment, `#` included, is left in
+    /// the scratch buffer.
+    fn readComment(self: *Parser, keep: bool) ReadError!void {
         if ((try self.s.peek()) != '#') return;
+        if (keep) self.scratch.clearRetainingCapacity();
         while (try self.s.peek()) |c| {
             if (c == '\n') break;
             if (c == '\r') {
@@ -267,8 +283,40 @@ const Parser = struct {
                 return self.err("bare carriage return in comment");
             }
             if (isForbiddenControl(c)) return self.err("control character in comment");
+            if (keep) try self.scratch.append(self.gpa, c);
             try self.s.bump();
         }
+    }
+
+    /// Collects the blank and comment lines before the next item into `pending`.
+    /// Runs of blank lines collapse to one.
+    fn gatherLeading(self: *Parser) ReadError!void {
+        while (true) {
+            try self.skipWs();
+            var had_comment = false;
+            if ((try self.s.peek()) == '#') {
+                try self.readComment(true);
+                try self.pending.append(self.gpa, try self.takeScratch());
+                had_comment = true;
+            }
+            if (!try self.eatNewline()) return;
+            if (had_comment) continue;
+            const n = self.pending.items.len;
+            if (n == 0 and !self.seen_item) continue;
+            if (n != 0 and self.pending.items[n - 1].len == 0) continue;
+            try self.pending.append(self.gpa, "");
+        }
+    }
+
+    /// Moves `pending` and `trailing` onto an item.
+    fn takeComments(self: *Parser) Error!Comments {
+        defer {
+            self.pending.clearRetainingCapacity();
+            self.trailing = null;
+            self.seen_item = true;
+        }
+        if (self.pending.items.len == 0 and self.trailing == null) return .{};
+        return .{ .before = try self.arena.dupe([]const u8, self.pending.items), .after = self.trailing };
     }
 
     /// Whitespace, comments and newlines, as between top-level expressions.
@@ -282,7 +330,10 @@ const Parser = struct {
 
     fn expectEndOfLine(self: *Parser) ReadError!void {
         try self.skipWs();
-        try self.skipComment();
+        if ((try self.s.peek()) == '#') {
+            try self.readComment(true);
+            self.trailing = try self.takeScratch();
+        }
         if ((try self.s.peek()) == null) return;
         if (!try self.eatNewline()) return self.err("expected end of line");
     }
@@ -291,14 +342,23 @@ const Parser = struct {
 
     fn document(self: *Parser) ReadError!void {
         while (true) {
-            try self.skipBlank();
-            const c = (try self.s.peek()) orelse return;
+            try self.gatherLeading();
+            const c = (try self.s.peek()) orelse {
+                var n = self.pending.items.len;
+                while (n > 0 and self.pending.items[n - 1].len == 0) n -= 1;
+                if (n != 0) self.root.footer = try self.arena.dupe([]const u8, self.pending.items[0..n]);
+                return;
+            };
             if (c == '[') {
                 if ((try self.s.peekAt(1)) == '[') try self.arrayTableHeader() else try self.tableHeader();
+                try self.expectEndOfLine();
+                self.current.header = try self.takeComments();
             } else {
-                try self.keyValue(self.current);
+                const at = try self.keyValue(self.current);
+                try self.expectEndOfLine();
+                const c2 = try self.takeComments();
+                if (!c2.isEmpty()) try at.table.key_comments.put(self.arena, at.key, c2);
             }
-            try self.expectEndOfLine();
         }
     }
 
@@ -393,7 +453,7 @@ const Parser = struct {
     // ---- keys and values -------------------------------------------------
 
     /// key = value, where key may be dotted. Inserts into `table`.
-    fn keyValue(self: *Parser, table: *Table) ReadError!void {
+    fn keyValue(self: *Parser, table: *Table) ReadError!struct { table: *Table, key: []const u8 } {
         const start = self.s.loc();
         const keys = try self.key();
         try self.skipWs();
@@ -421,6 +481,7 @@ const Parser = struct {
         if (cur.get(last) != null) return self.errAt(start, "duplicate key");
         const v = try self.val();
         try cur.put(self.arena, last, v);
+        return .{ .table = cur, .key = last };
     }
 
     /// Parses `simple-key *( dot-sep simple-key )`.
@@ -506,7 +567,7 @@ const Parser = struct {
         if (try self.eat('}')) return .{ .table = t };
         while (true) {
             try self.skipWs();
-            try self.keyValue(t);
+            _ = try self.keyValue(t);
             try self.skipWs();
             switch ((try self.s.peek()) orelse return self.err("unterminated inline table")) {
                 ',' => {
@@ -530,7 +591,7 @@ const Parser = struct {
         while (true) {
             try self.skipBlank();
             if (try self.eat('}')) return;
-            try self.keyValue(t);
+            _ = try self.keyValue(t);
             try self.skipBlank();
             switch ((try self.s.peek()) orelse return self.err("unterminated inline table")) {
                 ',' => try self.s.bump(),

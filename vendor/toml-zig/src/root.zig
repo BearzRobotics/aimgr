@@ -17,6 +17,7 @@ pub const Value = @import("value.zig").Value;
 pub const Table = @import("value.zig").Table;
 pub const TableKind = @import("value.zig").TableKind;
 pub const Array = @import("value.zig").Array;
+pub const Comments = @import("value.zig").Comments;
 pub const Datetime = @import("value.zig").Datetime;
 pub const Date = @import("value.zig").Date;
 pub const Time = @import("value.zig").Time;
@@ -103,6 +104,50 @@ pub const Document = struct {
             }
         }
         try cur.put(a, try self.dupe(path[path.len - 1]), v);
+    }
+
+    /// Attaches comments to the item at `path`: its `key = value` line, or its
+    /// `[header]` line if it is a table written as a section. For an array of
+    /// tables, the header of its last element. Strings in `c` are copied. Fails
+    /// with `error.NotFound` if there is no such item and `error.InvalidComment`
+    /// if a line is not empty or `#...`.
+    pub fn setComments(self: *Document, path: []const []const u8, c: Comments) (Allocator.Error || error{ NotFound, InvalidComment })!void {
+        std.debug.assert(path.len > 0);
+        try @import("value.zig").checkComments(c);
+        var cur = self.root;
+        for (path[0 .. path.len - 1]) |seg| {
+            switch (cur.get(seg) orelse return error.NotFound) {
+                .table => |t| cur = t,
+                .array => |a| {
+                    if (!a.is_table_array or a.items.items.len == 0) return error.NotFound;
+                    cur = a.items.items[a.items.items.len - 1].table;
+                },
+                else => return error.NotFound,
+            }
+        }
+        const last = path[path.len - 1];
+        const a = self.allocator();
+        const own: Comments = .{
+            .before = blk: {
+                const out = try a.alloc([]const u8, c.before.len);
+                for (c.before, out) |l, *o| o.* = try a.dupe(u8, l);
+                break :blk out;
+            },
+            .after = if (c.after) |x| try a.dupe(u8, x) else null,
+        };
+        const v = cur.get(last) orelse return error.NotFound;
+        switch (v) {
+            .table => |t| if (t.kind != .inline_table) {
+                t.header = own;
+                return;
+            },
+            .array => |arr| if (arr.is_table_array and arr.items.items.len > 0) {
+                arr.items.items[arr.items.items.len - 1].table.header = own;
+                return;
+            },
+            else => {},
+        }
+        try cur.setComments(a, last, own);
     }
 
     /// Writes the document as TOML. See `writer.zig` for what is preserved.

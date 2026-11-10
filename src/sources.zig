@@ -184,7 +184,7 @@ fn tomlQuote(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 pub fn serialize(arena: std.mem.Allocator, sources: []const Source) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    try w.writeAll("# aimgr configuration (managed by `aimgr sources`; comments are not preserved when it rewrites this file)\n");
+    try w.writeAll("# aimgr configuration (managed by `aimgr sources`; your own comments on its tables are kept)\n");
     for (sources) |s| {
         try w.writeAll("\n[[source]]\nid = ");
         try tomlQuote(w, s.id);

@@ -796,3 +796,99 @@ test "1.1: version defaults to 1.1" {
     doc.deinit();
     try testing.expectEqual(toml.Version.v1_1, (toml.Options{}).version);
 }
+
+// ---- comment preservation ----------------------------------------------
+
+/// Parse, write, and require the text to come back unchanged; then once more
+/// to show it is a fixed point.
+fn roundTrips(src: []const u8) !void {
+    var doc = try parseOk(src);
+    defer doc.deinit();
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(src, out);
+}
+
+test "comments survive a round trip" {
+    try roundTrips(
+        \\# Settings for the panel.
+        \\# Edit with care.
+        \\
+        \\# where it sits
+        \\position = "top" # or "bottom"
+        \\size = 12
+        \\
+        \\# the clock
+        \\[clock] # header note
+        \\# 24 hour?
+        \\military = true
+        \\
+        \\# first entry
+        \\[[items]]
+        \\name = "a" # one
+        \\
+        \\[[items]]
+        \\# second
+        \\name = "b"
+        \\
+        \\# the end
+        \\
+    );
+}
+
+test "a comment moves with its key when the writer reorders" {
+    var doc2 = try parseOk("# about a\na = 1 # a!\n[s]\nb = 2\n");
+    defer doc2.deinit();
+    try doc2.set(&.{"c"}, .{ .integer = 3 });
+    const out = try doc2.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# about a\na = 1 # a!\nc = 3\n\n[s]\nb = 2\n", out);
+}
+
+test "editing a value keeps its comments; removing the key drops them" {
+    var doc = try parseOk("# keep\nk = 1 # me\nj = 2 # gone\n");
+    defer doc.deinit();
+    try doc.set(&.{"k"}, .{ .integer = 5 });
+    try testing.expect(doc.root.remove("j"));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# keep\nk = 5 # me\n", out);
+}
+
+test "setComments on keys and headers" {
+    var doc = try parseOk("a = 1\n[t]\nb = 2\n");
+    defer doc.deinit();
+    try doc.setComments(&.{"a"}, .{ .before = &.{"# about a"}, .after = "# note" });
+    try doc.setComments(&.{"t"}, .{ .before = &.{ "", "# table t" } });
+    try doc.setComments(&.{ "t", "b" }, .{ .after = "# b" });
+    try testing.expectError(error.NotFound, doc.setComments(&.{"zz"}, .{ .after = "# x" }));
+    try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .after = "no hash" }));
+    try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .before = &.{"# a\nb = 1"} }));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# about a\na = 1 # note\n\n# table t\n[t]\nb = 2 # b\n", out);
+    // Clearing them again.
+    try doc.setComments(&.{"a"}, .{});
+    try testing.expect(doc.root.commentsOf("a") == null);
+}
+
+test "a comment-only document and CRLF line endings keep their comments" {
+    try roundTrips("# just a comment\n");
+    var doc = try parseOk("# c\r\nk = 1 # t\r\n");
+    defer doc.deinit();
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# c\nk = 1 # t\n", out);
+}
+
+test "comment parsing does not leak on allocation failure" {
+    const src = "# a\nk = 1 # b\n\n# c\n[t] # d\nx = 2\n# end\n";
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        if (toml.Document.parse(fa.allocator(), src, .{}, null)) |*d| {
+            var dd = d.*;
+            dd.deinit();
+        } else |_| {}
+    }
+}

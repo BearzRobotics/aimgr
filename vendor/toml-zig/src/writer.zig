@@ -1,15 +1,17 @@
 //! Serializes a table tree back to TOML text.
 //!
 //! Output is deterministic: keys appear in insertion order, scalar keys before
-//! sub-tables. Comments and original formatting are NOT preserved (the data
-//! model does not store them); unknown keys are preserved because the whole
-//! tree is.
+//! sub-tables. Comments (and the blank lines kept with them) are written back
+//! next to the item they were attached to; other formatting is not preserved,
+//! and comments inside arrays and inline tables are dropped. Unknown keys are
+//! preserved because the whole tree is.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const value = @import("value.zig");
 const Value = value.Value;
 const Table = value.Table;
+const Comments = value.Comments;
 const Writer = std.Io.Writer;
 
 pub const Error = Writer.Error || Allocator.Error;
@@ -19,6 +21,25 @@ pub fn writeTable(gpa: Allocator, w: *Writer, root: *const Table) Error!void {
     defer path.deinit(gpa);
     var first = true;
     try emit(gpa, w, root, &path, false, &first);
+    if (root.footer.len != 0) {
+        if (!first and root.footer[0].len != 0) try w.writeByte('\n');
+        try lines(w, root.footer);
+    }
+}
+
+fn lines(w: *Writer, ls: []const []const u8) Writer.Error!void {
+    for (ls) |l| {
+        try w.writeAll(l);
+        try w.writeByte('\n');
+    }
+}
+
+fn after(w: *Writer, c: Comments) Writer.Error!void {
+    if (c.after) |a| {
+        try w.writeByte(' ');
+        try w.writeAll(a);
+    }
+    try w.writeByte('\n');
 }
 
 /// Can `t` be written as a `[header]` section? Inline tables, and anything
@@ -37,10 +58,12 @@ fn emit(gpa: Allocator, w: *Writer, t: *const Table, path: *std.ArrayList([]cons
     const vals = t.entries.values();
     for (keys, vals) |k, v| {
         if (isSection(v)) continue;
+        const c = t.commentsOf(k) orelse Comments{};
+        try lines(w, c.before);
         try writeKey(w, k);
         try w.writeAll(" = ");
         try writeInline(w, v);
-        try w.writeByte('\n');
+        try after(w, c);
         first.* = false;
     }
     for (keys, vals) |k, v| {
@@ -51,12 +74,12 @@ fn emit(gpa: Allocator, w: *Writer, t: *const Table, path: *std.ArrayList([]cons
             .table => |sub| {
                 // An implicit parent with only sub-tables needs no header of its own.
                 if (!onlySections(sub)) {
-                    try header(w, path.items, false, first);
+                    try header(w, path.items, false, first, sub.header);
                 }
                 try emit(gpa, w, sub, path, false, first);
             },
             .array => |a| for (a.items.items) |item| {
-                try header(w, path.items, true, first);
+                try header(w, path.items, true, first, item.table.header);
                 try emit(gpa, w, item.table, path, true, first);
             },
             else => unreachable,
@@ -70,15 +93,18 @@ fn onlySections(t: *const Table) bool {
     return true;
 }
 
-fn header(w: *Writer, path: []const []const u8, array: bool, first: *bool) Writer.Error!void {
-    if (!first.*) try w.writeByte('\n');
+fn header(w: *Writer, path: []const []const u8, array: bool, first: *bool, c: Comments) Writer.Error!void {
+    // A blank line sets a section apart, unless its comments already start with one.
+    if (!first.* and (c.before.len == 0 or c.before[0].len != 0)) try w.writeByte('\n');
     first.* = false;
+    try lines(w, c.before);
     try w.writeAll(if (array) "[[" else "[");
     for (path, 0..) |seg, i| {
         if (i != 0) try w.writeByte('.');
         try writeKey(w, seg);
     }
-    try w.writeAll(if (array) "]]\n" else "]\n");
+    try w.writeAll(if (array) "]]" else "]");
+    try after(w, c);
 }
 
 pub fn writeKey(w: *Writer, key: []const u8) Writer.Error!void {

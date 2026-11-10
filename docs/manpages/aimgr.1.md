@@ -1,4 +1,4 @@
-% AIMGR(1) Version 0.2.0 | aimgr Manual
+% AIMGR(1) Version 0.2.1 | aimgr Manual
 % aimgr contributors
 % 2026-11-08
 
@@ -155,7 +155,7 @@ $XDG_CONFIG_HOME/aimgr/models.toml
 : User catalog overlay: [[model]] tables with backend, id, name, description, notes, use_cases, aliases, tags. Overrides bundled entries for the same backend and id. An invalid overlay is ignored with a visible message.
 
 $XDG_CONFIG_HOME/aimgr/config.toml
-: Sources ([[source]]), per-model agent settings ([[agent]]) and schedules ([[schedule]]); rewritten by aimgr (comments are not kept).
+: Sources ([[source]]), per-model agent settings ([[agent]]) and schedules ([[schedule]]); rewritten by aimgr (comments above a table or on its keys are kept).
 
 $XDG_CONFIG_HOME/aimgr/trusted-dirs
 : Folders you trusted for agent sessions, one per line.
